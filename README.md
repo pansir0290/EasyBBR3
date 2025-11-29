@@ -31,19 +31,9 @@
 ### 一键运行
 
 ```bash
-wget  https://github.com/xx2468171796/EasyBBR3/blob/main/easybbr3.sh
+wget  https://raw.githubusercontent.com/xx2468171796/EasyBBR3/main/easybbr3.sh
 chmod +x easybbr3.sh
 ./easybbr3.sh
-```
-
-### 下载后运行
-
-```bash
-wget https://raw.githubusercontent.com/xx2468171796/bbr3/main/bbr.sh
-chmod +x bbr.sh
-sudo ./bbr.sh
-```
-
 ### 安装快捷命令
 
 ```bash
