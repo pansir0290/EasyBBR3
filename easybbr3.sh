@@ -13,8 +13,8 @@
 #  REQUIREMENTS: root 权限, bash 4.0+
 #        AUTHOR: 孤独制作
 #       VERSION: 2.0.1
-#       CREATED: 2024
-#      REVISION: 2024-11-29
+#       CREATED: 2025
+#      REVISION: 2025-11-24
 #       LICENSE: MIT
 #      TELEGRAM: https://t.me/+RZMe7fnvvUg1OWJl
 #        GITHUB: https://github.com/xx2468171796
@@ -2474,6 +2474,12 @@ EOF
 install_system_services() {
     local services_to_install=("$@")
     
+    # 检查是否支持 systemd
+    local has_systemd=false
+    if command -v systemctl &>/dev/null && systemctl --version &>/dev/null 2>&1; then
+        has_systemd=true
+    fi
+    
     for service in "${services_to_install[@]}"; do
         case "$service" in
             irqbalance)
@@ -2484,22 +2490,35 @@ install_system_services() {
                         yum) yum install -y -q irqbalance >/dev/null 2>&1 ;;
                         dnf) dnf install -y -q irqbalance >/dev/null 2>&1 ;;
                     esac
-                    systemctl enable irqbalance >/dev/null 2>&1
-                    systemctl start irqbalance >/dev/null 2>&1
-                    print_success "irqbalance 已安装并启动"
-                else
-                    # 服务已安装，检查是否运行
+                fi
+                
+                # 检查服务是否可用并启动
+                if [[ "$has_systemd" == "true" ]] && systemctl list-unit-files irqbalance.service &>/dev/null; then
                     if systemctl is-active irqbalance >/dev/null 2>&1; then
                         print_info "irqbalance 已在运行"
                     else
-                        print_step "启动 irqbalance..."
                         systemctl enable irqbalance >/dev/null 2>&1
                         if systemctl start irqbalance >/dev/null 2>&1; then
                             print_success "irqbalance 已启动"
                         else
-                            print_warn "irqbalance 启动失败"
+                            print_warn "irqbalance 启动失败 (容器环境可能不支持)"
                         fi
                     fi
+                elif command -v irqbalance &>/dev/null; then
+                    # 容器环境：尝试直接运行
+                    if pgrep -x irqbalance >/dev/null 2>&1; then
+                        print_info "irqbalance 已在运行"
+                    else
+                        # 尝试 oneshot 模式或后台运行
+                        irqbalance --oneshot >/dev/null 2>&1 || nohup irqbalance >/dev/null 2>&1 &
+                        if pgrep -x irqbalance >/dev/null 2>&1; then
+                            print_success "irqbalance 已启动"
+                        else
+                            print_warn "irqbalance 在此环境不可用 (容器限制)"
+                        fi
+                    fi
+                else
+                    print_warn "irqbalance 安装失败"
                 fi
                 ;;
             haveged)
@@ -2510,22 +2529,36 @@ install_system_services() {
                         yum) yum install -y -q haveged >/dev/null 2>&1 ;;
                         dnf) dnf install -y -q haveged >/dev/null 2>&1 ;;
                     esac
-                    systemctl enable haveged >/dev/null 2>&1
-                    systemctl start haveged >/dev/null 2>&1
-                    print_success "haveged 已安装并启动"
-                else
-                    # 服务已安装，检查是否运行
+                fi
+                
+                # 检查服务是否可用并启动
+                if [[ "$has_systemd" == "true" ]] && systemctl list-unit-files haveged.service &>/dev/null; then
                     if systemctl is-active haveged >/dev/null 2>&1; then
                         print_info "haveged 已在运行"
                     else
-                        print_step "启动 haveged..."
                         systemctl enable haveged >/dev/null 2>&1
                         if systemctl start haveged >/dev/null 2>&1; then
                             print_success "haveged 已启动"
                         else
-                            print_warn "haveged 启动失败"
+                            print_warn "haveged 启动失败 (容器环境可能不支持)"
                         fi
                     fi
+                elif command -v haveged &>/dev/null; then
+                    # 容器环境：尝试直接运行
+                    if pgrep -x haveged >/dev/null 2>&1; then
+                        print_info "haveged 已在运行"
+                    else
+                        # 尝试后台运行
+                        nohup haveged -w 1024 >/dev/null 2>&1 &
+                        sleep 0.5
+                        if pgrep -x haveged >/dev/null 2>&1; then
+                            print_success "haveged 已启动"
+                        else
+                            print_warn "haveged 在此环境不可用 (容器限制)"
+                        fi
+                    fi
+                else
+                    print_warn "haveged 安装失败"
                 fi
                 ;;
         esac
@@ -4070,7 +4103,7 @@ normalize_algo() {
     if [[ "$algo" == "bbr3" ]]; then
         if ! echo "$(detect_available_algos)" | grep -qw "bbr3"; then
             if echo "$(detect_available_algos)" | grep -qw "bbr" && version_ge "$kver" "6.9.0"; then
-                print_info "此内核以 'bbr' 名称提供 BBRv3"
+                print_info "此内核以 'bbr' 名称提供 BBRv3" >&2
                 echo "bbr"
                 return 0
             fi
@@ -6199,11 +6232,23 @@ main() {
         CHOSEN_ALGO=$(normalize_algo "$CHOSEN_ALGO")
         CHOSEN_QDISC="${CHOSEN_QDISC:-fq}"
         
-        # 设置默认缓冲区
-        TUNE_RMEM_MAX=${TUNE_RMEM_MAX:-67108864}
-        TUNE_WMEM_MAX=${TUNE_WMEM_MAX:-67108864}
-        TUNE_TCP_RMEM_HIGH=${TUNE_TCP_RMEM_HIGH:-67108864}
-        TUNE_TCP_WMEM_HIGH=${TUNE_TCP_WMEM_HIGH:-67108864}
+        # 设置默认缓冲区（检测容器限制）
+        local max_rmem max_wmem
+        max_rmem=$(cat /proc/sys/net/core/rmem_max 2>/dev/null || echo "67108864")
+        max_wmem=$(cat /proc/sys/net/core/wmem_max 2>/dev/null || echo "67108864")
+        
+        # 容器环境可能有限制，使用当前值的10倍或67108864中的较小值
+        if [[ $max_rmem -lt 1048576 ]]; then
+            TUNE_RMEM_MAX=${TUNE_RMEM_MAX:-$((max_rmem * 10))}
+            TUNE_WMEM_MAX=${TUNE_WMEM_MAX:-$((max_wmem * 10))}
+            TUNE_TCP_RMEM_HIGH=${TUNE_TCP_RMEM_HIGH:-$((max_rmem * 10))}
+            TUNE_TCP_WMEM_HIGH=${TUNE_TCP_WMEM_HIGH:-$((max_wmem * 10))}
+        else
+            TUNE_RMEM_MAX=${TUNE_RMEM_MAX:-67108864}
+            TUNE_WMEM_MAX=${TUNE_WMEM_MAX:-67108864}
+            TUNE_TCP_RMEM_HIGH=${TUNE_TCP_RMEM_HIGH:-67108864}
+            TUNE_TCP_WMEM_HIGH=${TUNE_TCP_WMEM_HIGH:-67108864}
+        fi
         
         # 写入配置
         write_sysctl "$CHOSEN_ALGO" "$CHOSEN_QDISC"
