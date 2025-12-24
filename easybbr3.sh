@@ -1949,6 +1949,1658 @@ STD_CONF
     return 0
 }
 
+#===============================================================================
+# 代理服务器智能调优向导
+#===============================================================================
+
+# 缓冲区大小常量
+readonly BUFFER_16MB=16777216
+readonly BUFFER_32MB=33554432
+readonly BUFFER_64MB=67108864
+readonly BUFFER_128MB=134217728
+
+# 连接数常量
+readonly MAX_SOMAXCONN=65535
+readonly MAX_CONNTRACK=262144
+
+# 代理调优配置变量
+PROXY_HARDWARE_SCORE=0
+PROXY_IS_LOW_SPEC=false
+PROXY_CHAIN_ARCH=""
+PROXY_NODE_ROLE=""
+PROXY_SERVER_LOCATION=""
+PROXY_CLIENT_LOCATION=""
+PROXY_LINE_TYPE=""
+PROXY_KERNEL=""
+PROXY_PROTOCOL=""
+PROXY_RESOURCE_RATIO=100
+PROXY_ADVANCED_OPTS=""
+PROXY_PROFILE_FILE="/etc/bbr3-profile.conf"
+
+# 检测完整硬件信息
+detect_full_hardware() {
+    local cpu_score=0
+    local mem_score=0
+    local disk_score=0
+    
+    # CPU 评分 (0-100)
+    local cpu_cores
+    cpu_cores=$(nproc 2>/dev/null || echo 1)
+    if [[ $cpu_cores -ge 8 ]]; then
+        cpu_score=100
+    elif [[ $cpu_cores -ge 4 ]]; then
+        cpu_score=80
+    elif [[ $cpu_cores -ge 2 ]]; then
+        cpu_score=60
+    else
+        cpu_score=30
+    fi
+    
+    # 内存评分 (0-100)
+    local mem_mb
+    mem_mb=$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null || echo 512)
+    if [[ $mem_mb -ge 8192 ]]; then
+        mem_score=100
+    elif [[ $mem_mb -ge 4096 ]]; then
+        mem_score=80
+    elif [[ $mem_mb -ge 2048 ]]; then
+        mem_score=60
+    elif [[ $mem_mb -ge 1024 ]]; then
+        mem_score=40
+    else
+        mem_score=20
+    fi
+    
+    # 磁盘评分 (0-100)
+    local disk_type="hdd"
+    if [[ -d /sys/block ]]; then
+        for disk in /sys/block/sd* /sys/block/vd* /sys/block/nvme* 2>/dev/null; do
+            [[ -d "$disk" ]] || continue
+            local rotational
+            rotational=$(cat "${disk}/queue/rotational" 2>/dev/null || echo 1)
+            if [[ "$rotational" == "0" ]]; then
+                if [[ "$disk" == *nvme* ]]; then
+                    disk_type="nvme"
+                else
+                    disk_type="ssd"
+                fi
+                break
+            fi
+        done
+    fi
+    
+    case "$disk_type" in
+        nvme) disk_score=100 ;;
+        ssd)  disk_score=80 ;;
+        *)    disk_score=40 ;;
+    esac
+    
+    # 综合评分
+    PROXY_HARDWARE_SCORE=$(( (cpu_score * 30 + mem_score * 40 + disk_score * 30) / 100 ))
+    
+    # 存储检测结果
+    PROXY_CPU_CORES=$cpu_cores
+    PROXY_MEM_MB=$mem_mb
+    PROXY_DISK_TYPE=$disk_type
+}
+
+# 检测是否为低配 VPS
+is_low_spec_vps() {
+    detect_full_hardware
+    
+    if [[ $PROXY_MEM_MB -le 1024 ]] || [[ $PROXY_CPU_CORES -le 1 ]]; then
+        PROXY_IS_LOW_SPEC=true
+        return 0
+    fi
+    PROXY_IS_LOW_SPEC=false
+    return 1
+}
+
+# 显示硬件报告
+show_hardware_report() {
+    detect_full_hardware
+    is_low_spec_vps
+    
+    echo
+    echo -e "  ${BOLD}硬件检测结果${NC}"
+    print_separator
+    echo
+    printf "    %-15s : %s 核\n" "CPU" "$PROXY_CPU_CORES"
+    printf "    %-15s : %s MB\n" "内存" "$PROXY_MEM_MB"
+    printf "    %-15s : %s\n" "磁盘类型" "$PROXY_DISK_TYPE"
+    printf "    %-15s : %s\n" "系统" "$DIST_ID $DIST_VERSION"
+    printf "    %-15s : %s\n" "内核" "$(uname -r)"
+    printf "    %-15s : %s\n" "虚拟化" "${VIRT_TYPE:-未知}"
+    echo
+    printf "    %-15s : %s/100\n" "硬件评分" "$PROXY_HARDWARE_SCORE"
+    
+    if [[ "$PROXY_IS_LOW_SPEC" == "true" ]]; then
+        echo
+        echo -e "    ${YELLOW}${ICON_WARN} 检测到低配 VPS，将启用激进优化模式${NC}"
+    fi
+    echo
+}
+
+# 检测当前内核
+check_current_kernel() {
+    local kernel_version
+    kernel_version=$(uname -r)
+    
+    local has_bbr3=false
+    if [[ -f /proc/sys/net/ipv4/tcp_available_congestion_control ]]; then
+        if grep -q "bbr3" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+            has_bbr3=true
+        fi
+    fi
+    
+    echo
+    echo -e "  ${BOLD}内核检测${NC}"
+    print_separator
+    echo
+    printf "    %-15s : %s\n" "当前内核" "$kernel_version"
+    
+    if [[ "$has_bbr3" == "true" ]]; then
+        printf "    %-15s : ${GREEN}✅ 已支持${NC}\n" "BBR3 支持"
+    else
+        printf "    %-15s : ${YELLOW}❌ 需要安装新内核${NC}\n" "BBR3 支持"
+    fi
+    echo
+    
+    [[ "$has_bbr3" == "true" ]]
+}
+
+# 询问链路架构
+ask_chain_architecture() {
+    echo
+    echo -e "  ${BOLD}Q1. 这台机器的链路架构是什么？${NC}"
+    echo
+    echo -e "    ${CYAN}1)${NC} 单机模式 (用户直连本机)"
+    echo -e "    ${CYAN}2)${NC} 中转链路 (用户 → 本机 → 落地机)"
+    echo -e "    ${CYAN}3)${NC} 落地节点 (中转机 → 本机 → 目标网站)"
+    echo -e "    ${CYAN}4)${NC} 多级中转 (入口 → 本机 → 落地机)"
+    echo
+    
+    read_choice "您的选择" 4
+    
+    case "$MENU_CHOICE" in
+        1) PROXY_CHAIN_ARCH="single"; PROXY_NODE_ROLE="single" ;;
+        2) PROXY_CHAIN_ARCH="relay"; PROXY_NODE_ROLE="relay" ;;
+        3) PROXY_CHAIN_ARCH="exit"; PROXY_NODE_ROLE="exit" ;;
+        4) PROXY_CHAIN_ARCH="multi"; PROXY_NODE_ROLE="relay" ;;
+    esac
+}
+
+# 询问服务器位置
+ask_server_location() {
+    echo
+    echo -e "  ${BOLD}Q2. 这台服务器在哪里？${NC}"
+    echo
+    echo -e "    ${CYAN}1)${NC} 美国        ${CYAN}5)${NC} 台湾"
+    echo -e "    ${CYAN}2)${NC} 日本        ${CYAN}6)${NC} 韩国"
+    echo -e "    ${CYAN}3)${NC} 香港        ${CYAN}7)${NC} 欧洲"
+    echo -e "    ${CYAN}4)${NC} 新加坡      ${CYAN}8)${NC} 其他"
+    echo
+    
+    read_choice "您的选择" 8
+    
+    case "$MENU_CHOICE" in
+        1) PROXY_SERVER_LOCATION="us" ;;
+        2) PROXY_SERVER_LOCATION="jp" ;;
+        3) PROXY_SERVER_LOCATION="hk" ;;
+        4) PROXY_SERVER_LOCATION="sg" ;;
+        5) PROXY_SERVER_LOCATION="tw" ;;
+        6) PROXY_SERVER_LOCATION="kr" ;;
+        7) PROXY_SERVER_LOCATION="eu" ;;
+        8) PROXY_SERVER_LOCATION="other" ;;
+    esac
+}
+
+# 询问客户端位置
+ask_client_location() {
+    echo
+    echo -e "  ${BOLD}Q3. 翻墙用户主要在哪里？${NC}"
+    echo
+    echo -e "    ${CYAN}1)${NC} 中国大陆 - 电信用户为主"
+    echo -e "    ${CYAN}2)${NC} 中国大陆 - 联通用户为主"
+    echo -e "    ${CYAN}3)${NC} 中国大陆 - 移动用户为主"
+    echo -e "    ${CYAN}4)${NC} 中国大陆 - 混合运营商"
+    echo -e "    ${CYAN}5)${NC} 海外华人"
+    echo
+    
+    read_choice "您的选择" 5
+    
+    case "$MENU_CHOICE" in
+        1) PROXY_CLIENT_LOCATION="cn_telecom" ;;
+        2) PROXY_CLIENT_LOCATION="cn_unicom" ;;
+        3) PROXY_CLIENT_LOCATION="cn_mobile" ;;
+        4) PROXY_CLIENT_LOCATION="cn_mixed" ;;
+        5) PROXY_CLIENT_LOCATION="overseas" ;;
+    esac
+}
+
+# 询问线路类型
+ask_line_type() {
+    echo
+    echo -e "  ${BOLD}Q4. 这台机器的线路类型？（不确定可选 7）${NC}"
+    echo
+    echo -e "    ${CYAN}1)${NC} CN2 GIA (电信顶级，低延迟低丢包)"
+    echo -e "    ${CYAN}2)${NC} CN2 GT  (电信优质)"
+    echo -e "    ${CYAN}3)${NC} CMI     (移动国际)"
+    echo -e "    ${CYAN}4)${NC} 9929    (联通A网，优质)"
+    echo -e "    ${CYAN}5)${NC} 4837    (联通普通，晚高峰拥堵)"
+    echo -e "    ${CYAN}6)${NC} 163     (电信普通，晚高峰丢包)"
+    echo -e "    ${CYAN}7)${NC} 不确定 / 自动检测"
+    echo
+    
+    read_choice "您的选择" 7
+    
+    case "$MENU_CHOICE" in
+        1) PROXY_LINE_TYPE="cn2gia" ;;
+        2) PROXY_LINE_TYPE="cn2gt" ;;
+        3) PROXY_LINE_TYPE="cmi" ;;
+        4) PROXY_LINE_TYPE="9929" ;;
+        5) PROXY_LINE_TYPE="4837" ;;
+        6) PROXY_LINE_TYPE="163" ;;
+        7) PROXY_LINE_TYPE="auto"; detect_line_type ;;
+    esac
+}
+
+# 自动检测线路类型
+detect_line_type() {
+    echo
+    print_info "正在自动检测线路类型..."
+    
+    # 尝试 traceroute 检测 AS 号
+    local as_num=""
+    if command -v traceroute &>/dev/null; then
+        as_num=$(traceroute -A -n -m 5 8.8.8.8 2>/dev/null | grep -oE 'AS[0-9]+' | head -1 || true)
+    fi
+    
+    if [[ -n "$as_num" ]]; then
+        case "$as_num" in
+            AS4809)  PROXY_LINE_TYPE="cn2gia"; print_success "检测到 CN2 线路" ;;
+            AS58453) PROXY_LINE_TYPE="cmi"; print_success "检测到 CMI 线路" ;;
+            AS9929)  PROXY_LINE_TYPE="9929"; print_success "检测到 9929 线路" ;;
+            AS4837)  PROXY_LINE_TYPE="4837"; print_success "检测到 4837 线路" ;;
+            AS4134)  PROXY_LINE_TYPE="163"; print_success "检测到 163 线路" ;;
+            *)       PROXY_LINE_TYPE="unknown"; print_warn "未能识别线路类型，使用默认配置" ;;
+        esac
+    else
+        PROXY_LINE_TYPE="unknown"
+        print_warn "无法检测线路类型，使用默认配置"
+    fi
+}
+
+# 询问代理内核
+ask_proxy_kernel() {
+    echo
+    echo -e "  ${BOLD}Q5. 使用什么代理内核？${NC}"
+    echo
+    echo -e "    ${CYAN}1)${NC} Xray"
+    echo -e "    ${CYAN}2)${NC} Sing-box"
+    echo -e "    ${CYAN}3)${NC} V2Ray"
+    echo -e "    ${CYAN}4)${NC} Clash / Mihomo"
+    echo -e "    ${CYAN}5)${NC} Hysteria (独立)"
+    echo -e "    ${CYAN}6)${NC} 其他 / 不确定"
+    echo
+    
+    read_choice "您的选择" 6
+    
+    case "$MENU_CHOICE" in
+        1) PROXY_KERNEL="xray" ;;
+        2) PROXY_KERNEL="singbox" ;;
+        3) PROXY_KERNEL="v2ray" ;;
+        4) PROXY_KERNEL="clash" ;;
+        5) PROXY_KERNEL="hysteria" ;;
+        6) PROXY_KERNEL="other" ;;
+    esac
+}
+
+# 询问代理协议
+ask_proxy_protocol() {
+    echo
+    echo -e "  ${BOLD}Q6. 使用什么代理协议？${NC}"
+    echo
+    echo -e "    ${DIM}TCP 协议 (BBR3 优化生效):${NC}"
+    echo -e "    ${CYAN}1)${NC} VLESS / VMess"
+    echo -e "    ${CYAN}2)${NC} Trojan"
+    echo -e "    ${CYAN}3)${NC} Shadowsocks"
+    echo -e "    ${CYAN}4)${NC} Naive"
+    echo
+    echo -e "    ${DIM}UDP/QUIC 协议 (需要 UDP 缓冲优化):${NC}"
+    echo -e "    ${CYAN}5)${NC} Hysteria / Hysteria2"
+    echo -e "    ${CYAN}6)${NC} TUIC"
+    echo
+    echo -e "    ${DIM}特殊模式:${NC}"
+    echo -e "    ${CYAN}7)${NC} Tun / TProxy (透明代理)"
+    echo -e "    ${CYAN}8)${NC} 混合使用"
+    echo
+    
+    read_choice "您的选择" 8
+    
+    case "$MENU_CHOICE" in
+        1) PROXY_PROTOCOL="vless" ;;
+        2) PROXY_PROTOCOL="trojan" ;;
+        3) PROXY_PROTOCOL="ss" ;;
+        4) PROXY_PROTOCOL="naive" ;;
+        5) PROXY_PROTOCOL="hysteria" ;;
+        6) PROXY_PROTOCOL="tuic" ;;
+        7) PROXY_PROTOCOL="tun" ;;
+        8) PROXY_PROTOCOL="mixed" ;;
+    esac
+}
+
+# 询问资源占比
+ask_resource_ratio() {
+    echo
+    echo -e "  ${BOLD}Q7. 代理使用这台机器多少资源？${NC}"
+    echo
+    echo -e "    ${CYAN}1)${NC} 100% - 专用代理服务器（最激进优化）"
+    echo -e "    ${CYAN}2)${NC} 80%  - 主要用于代理"
+    echo -e "    ${CYAN}3)${NC} 50%  - 代理与其他用途各半"
+    echo -e "    ${CYAN}4)${NC} 30%  - 代理为辅"
+    echo
+    
+    read_choice "您的选择" 4
+    
+    case "$MENU_CHOICE" in
+        1) PROXY_RESOURCE_RATIO=100 ;;
+        2) PROXY_RESOURCE_RATIO=80 ;;
+        3) PROXY_RESOURCE_RATIO=50 ;;
+        4) PROXY_RESOURCE_RATIO=30 ;;
+    esac
+}
+
+# 询问高级优化
+ask_advanced_optimization() {
+    echo
+    echo -e "  ${BOLD}Q8. 是否启用高级系统优化？${NC}"
+    echo
+    echo -e "    ${CYAN}1)${NC} 是 - 启用全部推荐优化"
+    echo -e "    ${CYAN}2)${NC} 自定义选择"
+    echo -e "    ${CYAN}3)${NC} 否 - 仅使用基础优化"
+    echo
+    
+    read_choice "您的选择" 3
+    
+    case "$MENU_CHOICE" in
+        1) PROXY_ADVANCED_OPTS="all" ;;
+        2) PROXY_ADVANCED_OPTS="custom" ;;
+        3) PROXY_ADVANCED_OPTS="none" ;;
+    esac
+}
+
+# 获取 TCP 协议参数
+get_tcp_protocol_params() {
+    cat << 'EOF'
+# TCP 协议优化 (VLESS/VMess/Trojan/SS/Naive)
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_notsent_lowat = 16384
+EOF
+}
+
+# 检测 conntrack 模块是否可用
+check_conntrack_available() {
+    [[ -f /proc/sys/net/netfilter/nf_conntrack_max ]]
+}
+
+# 获取 UDP 协议参数
+get_udp_protocol_params() {
+    echo "# UDP/QUIC 协议优化 (Hysteria/TUIC)"
+    echo "# 注意: BBR3 对 QUIC 无效，QUIC 自带拥塞控制"
+    echo "net.core.rmem_max = ${BUFFER_128MB}"
+    echo "net.core.wmem_max = ${BUFFER_128MB}"
+    echo "net.ipv4.udp_rmem_min = 16384"
+    echo "net.ipv4.udp_wmem_min = 16384"
+    
+    # 仅在 conntrack 模块可用时输出相关参数
+    if check_conntrack_available; then
+        echo "net.netfilter.nf_conntrack_max = ${MAX_CONNTRACK}"
+        echo "net.netfilter.nf_conntrack_udp_timeout = 60"
+        echo "net.netfilter.nf_conntrack_udp_timeout_stream = 180"
+    else
+        echo "# conntrack 模块未加载，跳过相关参数"
+    fi
+}
+
+# 获取 Tun/TProxy 参数
+get_tun_tproxy_params() {
+    cat << 'EOF'
+# Tun/TProxy 透明代理优化
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.route_localnet = 1
+net.ipv4.conf.all.forwarding = 1
+EOF
+}
+
+# 获取角色参数
+get_role_params() {
+    local role="$1"
+    
+    case "$role" in
+        exit)
+            # 落地机：大缓冲区，抗丢包
+            echo "# 落地机优化：大缓冲区，抗丢包"
+            echo "net.core.rmem_max = 67108864"
+            echo "net.core.wmem_max = 67108864"
+            echo "net.ipv4.tcp_rmem = 4096 131072 67108864"
+            echo "net.ipv4.tcp_wmem = 4096 65536 67108864"
+            echo "net.core.somaxconn = 4096"
+            echo "net.ipv4.tcp_max_orphans = 65535"
+            ;;
+        relay)
+            # 中转机：小缓冲区，低延迟
+            echo "# 中转机优化：小缓冲区，低延迟"
+            echo "net.core.rmem_max = 16777216"
+            echo "net.core.wmem_max = 16777216"
+            echo "net.ipv4.tcp_rmem = 4096 65536 16777216"
+            echo "net.ipv4.tcp_wmem = 4096 32768 16777216"
+            echo "net.core.somaxconn = 1024"
+            echo "net.ipv4.tcp_notsent_lowat = 8192"
+            ;;
+        entry)
+            # 入口机：高并发
+            echo "# 入口机优化：高并发"
+            echo "net.core.somaxconn = 65535"
+            echo "net.core.netdev_max_backlog = 65535"
+            echo "net.ipv4.tcp_max_syn_backlog = 65535"
+            ;;
+        *)
+            # 单机：均衡配置
+            echo "# 单机模式：均衡配置"
+            echo "net.core.rmem_max = 33554432"
+            echo "net.core.wmem_max = 33554432"
+            echo "net.ipv4.tcp_rmem = 4096 87380 33554432"
+            echo "net.ipv4.tcp_wmem = 4096 65536 33554432"
+            echo "net.core.somaxconn = 4096"
+            ;;
+    esac
+}
+
+# 获取高级 sysctl 参数
+get_advanced_sysctl_params() {
+    cat << 'EOF'
+# 高级系统优化
+net.ipv4.tcp_ecn = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_dsack = 1
+net.ipv4.tcp_fack = 1
+net.ipv4.tcp_timestamps = 1
+net.core.busy_poll = 50
+net.core.busy_read = 50
+EOF
+}
+
+# 安装系统服务
+install_system_services() {
+    local services_to_install=("$@")
+    
+    for service in "${services_to_install[@]}"; do
+        case "$service" in
+            irqbalance)
+                if ! command -v irqbalance &>/dev/null; then
+                    print_step "安装 irqbalance..."
+                    case "$PKG_MANAGER" in
+                        apt) apt-get install -y -qq irqbalance >/dev/null 2>&1 ;;
+                        yum) yum install -y -q irqbalance >/dev/null 2>&1 ;;
+                        dnf) dnf install -y -q irqbalance >/dev/null 2>&1 ;;
+                    esac
+                    systemctl enable irqbalance >/dev/null 2>&1
+                    systemctl start irqbalance >/dev/null 2>&1
+                    print_success "irqbalance 已安装并启动"
+                else
+                    print_info "irqbalance 已存在"
+                fi
+                ;;
+            haveged)
+                if ! command -v haveged &>/dev/null; then
+                    print_step "安装 haveged..."
+                    case "$PKG_MANAGER" in
+                        apt) apt-get install -y -qq haveged >/dev/null 2>&1 ;;
+                        yum) yum install -y -q haveged >/dev/null 2>&1 ;;
+                        dnf) dnf install -y -q haveged >/dev/null 2>&1 ;;
+                    esac
+                    systemctl enable haveged >/dev/null 2>&1
+                    systemctl start haveged >/dev/null 2>&1
+                    print_success "haveged 已安装并启动"
+                else
+                    print_info "haveged 已存在"
+                fi
+                ;;
+        esac
+    done
+}
+
+# 获取线路参数
+get_line_params() {
+    local line="$1"
+    
+    case "$line" in
+        cn2gia|9929)
+            # 优质线路：标准配置
+            echo "# 优质线路优化 (CN2 GIA/9929)"
+            echo "# 线路质量好，使用标准 BBR3 配置"
+            ;;
+        cn2gt|cmi)
+            # 中等线路：略增缓冲
+            echo "# 中等线路优化 (CN2 GT/CMI)"
+            echo "net.ipv4.tcp_retries2 = 10"
+            ;;
+        4837|163|unknown|*)
+            # 普通线路：激进配置，大缓冲区
+            echo "# 普通线路优化 (4837/163)"
+            echo "# 线路质量一般，增大缓冲区和重试次数"
+            echo "net.ipv4.tcp_retries2 = 15"
+            echo "net.ipv4.tcp_syn_retries = 3"
+            echo "net.ipv4.tcp_synack_retries = 3"
+            ;;
+    esac
+}
+
+# 应用低配优化
+apply_low_spec_optimization() {
+    cat << EOF
+# 低配 VPS 激进优化
+net.core.rmem_max = ${BUFFER_16MB}
+net.core.wmem_max = ${BUFFER_16MB}
+net.ipv4.tcp_rmem = 4096 65536 ${BUFFER_16MB}
+net.ipv4.tcp_wmem = 4096 32768 ${BUFFER_16MB}
+net.core.somaxconn = 1024
+net.ipv4.tcp_max_orphans = 8192
+net.ipv4.tcp_max_tw_buckets = 50000
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_probes = 3
+net.ipv4.tcp_keepalive_intvl = 10
+EOF
+}
+
+# 生成代理配置
+generate_proxy_config() {
+    local config_file="$SYSCTL_FILE"
+    
+    # 备份现有配置
+    if [[ -f "$config_file" ]]; then
+        backup_config
+    fi
+    
+    # 动态检测最佳算法
+    local best_algo best_qdisc
+    best_algo=$(suggest_best_algo 2>/dev/null || echo "bbr")
+    best_qdisc=$(suggest_best_qdisc "proxy" 2>/dev/null || echo "fq")
+    
+    # 生成新配置
+    cat > "$config_file" << EOF
+# BBR3 代理服务器智能调优配置
+# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
+# 硬件评分: ${PROXY_HARDWARE_SCORE}/100
+# 链路架构: ${PROXY_CHAIN_ARCH}
+# 节点角色: ${PROXY_NODE_ROLE}
+# 代理协议: ${PROXY_PROTOCOL}
+# 资源占比: ${PROXY_RESOURCE_RATIO}%
+
+# ========== 拥塞控制 ==========
+# 算法: ${best_algo} (动态检测: BBR3 > BBR2 > BBR > CUBIC)
+net.ipv4.tcp_congestion_control = ${best_algo}
+net.core.default_qdisc = ${best_qdisc}
+
+# ========== 基础 TCP 优化 ==========
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.ip_local_port_range = 1024 65535
+
+EOF
+
+    # 添加角色专用参数
+    get_role_params "$PROXY_NODE_ROLE" >> "$config_file"
+    echo >> "$config_file"
+    
+    # 添加协议专用参数
+    case "$PROXY_PROTOCOL" in
+        vless|vmess|trojan|ss|naive)
+            get_tcp_protocol_params >> "$config_file"
+            ;;
+        hysteria|tuic)
+            get_udp_protocol_params >> "$config_file"
+            ;;
+        tun)
+            get_tun_tproxy_params >> "$config_file"
+            ;;
+        mixed)
+            get_tcp_protocol_params >> "$config_file"
+            echo >> "$config_file"
+            get_udp_protocol_params >> "$config_file"
+            ;;
+    esac
+    echo >> "$config_file"
+    
+    # 添加线路优化参数
+    get_line_params "$PROXY_LINE_TYPE" >> "$config_file"
+    echo >> "$config_file"
+    
+    # 低配 VPS 激进优化
+    if [[ "$PROXY_IS_LOW_SPEC" == "true" ]]; then
+        apply_low_spec_optimization >> "$config_file"
+        echo >> "$config_file"
+    fi
+    
+    # 高级优化
+    if [[ "$PROXY_ADVANCED_OPTS" == "all" ]]; then
+        get_advanced_sysctl_params >> "$config_file"
+    fi
+}
+
+# 显示优化方案
+show_optimization_plan() {
+    echo
+    print_header "代理服务器智能调优方案"
+    echo
+    
+    # 用户配置
+    echo -e "  ${BOLD}📋 用户配置${NC}"
+    print_separator
+    printf "    %-15s : %s/100" "硬件评分" "$PROXY_HARDWARE_SCORE"
+    [[ "$PROXY_IS_LOW_SPEC" == "true" ]] && echo -e " ${YELLOW}(低配 VPS)${NC}" || echo
+    printf "    %-15s : %s\n" "链路架构" "$PROXY_CHAIN_ARCH"
+    printf "    %-15s : %s\n" "节点角色" "$PROXY_NODE_ROLE"
+    printf "    %-15s : %s\n" "服务器位置" "$PROXY_SERVER_LOCATION"
+    printf "    %-15s : %s\n" "客户端位置" "$PROXY_CLIENT_LOCATION"
+    printf "    %-15s : %s\n" "线路类型" "$PROXY_LINE_TYPE"
+    printf "    %-15s : %s\n" "代理内核" "$PROXY_KERNEL"
+    printf "    %-15s : %s\n" "代理协议" "$PROXY_PROTOCOL"
+    printf "    %-15s : %s%%\n" "资源占比" "$PROXY_RESOURCE_RATIO"
+    echo
+    
+    # 优化方案
+    echo -e "  ${BOLD}🚀 优化方案${NC}"
+    print_separator
+    echo
+    echo "    【内核优化】"
+    echo "    ├─ 拥塞控制算法:    BBR3 (最新)"
+    echo "    ├─ 队列调度:        fq (公平队列)"
+    echo "    └─ 预计提升:        30-50% 吞吐量"
+    echo
+    echo "    【缓冲区优化】"
+    if [[ "$PROXY_IS_LOW_SPEC" == "true" ]]; then
+        echo "    ├─ rmem_max:        16 MB (低配优化)"
+        echo "    └─ wmem_max:        16 MB"
+    else
+        echo "    ├─ rmem_max:        32-64 MB"
+        echo "    └─ wmem_max:        32-64 MB"
+    fi
+    echo
+    echo "    【TCP 优化】"
+    echo "    ├─ TCP Fast Open:   启用 (TFO=3)"
+    if [[ "$PROXY_ADVANCED_OPTS" == "all" ]]; then
+        echo "    ├─ TCP ECN:         启用"
+        echo "    ├─ SACK/DSACK:      启用"
+    fi
+    echo "    └─ 预计提升:        10-20% 延迟降低"
+    echo
+    
+    if [[ "$PROXY_ADVANCED_OPTS" == "all" ]]; then
+        echo "    【系统服务】"
+        echo "    ├─ irqbalance:      将安装并启用"
+        echo "    └─ haveged:         将安装并启用"
+        echo
+    fi
+    
+    # 将要执行的操作
+    echo -e "  ${BOLD}📝 将要执行的操作${NC}"
+    print_separator
+    echo "    1. 备份当前 sysctl 配置"
+    echo "    2. 写入新的 sysctl 配置到 ${SYSCTL_FILE}"
+    [[ "$PROXY_ADVANCED_OPTS" == "all" ]] && echo "    3. 安装 irqbalance 和 haveged"
+    echo "    4. 应用 sysctl 配置"
+    echo "    5. 验证配置生效"
+    echo
+    echo -e "  ${YELLOW}${ICON_WARN} 配置将立即生效，无需重启${NC}"
+    echo
+}
+
+# 执行优化
+execute_optimization() {
+    echo
+    print_header "执行优化"
+    echo
+    
+    # 步骤 1: 备份
+    print_step "[1/5] 备份当前配置..."
+    if backup_config; then
+        print_success "备份完成"
+    else
+        print_warn "无需备份（配置文件不存在）"
+    fi
+    
+    # 步骤 2: 生成配置
+    print_step "[2/5] 生成优化配置..."
+    generate_proxy_config
+    print_success "配置已生成"
+    
+    # 步骤 3: 安装系统服务
+    if [[ "$PROXY_ADVANCED_OPTS" == "all" ]]; then
+        print_step "[3/5] 安装系统服务..."
+        install_system_services "irqbalance" "haveged"
+    else
+        print_info "[3/5] 跳过系统服务安装"
+    fi
+    
+    # 步骤 4: 应用配置
+    print_step "[4/5] 应用 sysctl 配置..."
+    if sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1; then
+        print_success "配置已应用"
+    else
+        print_warn "部分参数可能不被当前内核支持"
+        # 逐行应用
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+            sysctl -w "$line" >/dev/null 2>&1 || true
+        done < "$SYSCTL_FILE"
+    fi
+    
+    # 步骤 5: 验证
+    print_step "[5/5] 验证配置..."
+    local current_algo
+    current_algo=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    local current_qdisc
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
+    
+    echo
+    echo -e "  ${BOLD}${GREEN}${ICON_OK} 优化完成！${NC}"
+    echo
+    echo -e "  ${BOLD}当前状态:${NC}"
+    printf "    %-15s : %s\n" "拥塞控制" "$current_algo"
+    printf "    %-15s : %s\n" "队列调度" "$current_qdisc"
+    
+    if [[ "$PROXY_ADVANCED_OPTS" == "all" ]]; then
+        local irq_status="未运行"
+        local haveged_status="未运行"
+        systemctl is-active irqbalance >/dev/null 2>&1 && irq_status="运行中"
+        systemctl is-active haveged >/dev/null 2>&1 && haveged_status="运行中"
+        printf "    %-15s : %s\n" "irqbalance" "$irq_status"
+        printf "    %-15s : %s\n" "haveged" "$haveged_status"
+    fi
+    echo
+    
+    # 保存配置
+    save_proxy_profile
+}
+
+# 保存代理配置
+save_proxy_profile() {
+    cat > "$PROXY_PROFILE_FILE" << EOF
+# BBR3 代理调优配置文件
+# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
+PROXY_HARDWARE_SCORE=$PROXY_HARDWARE_SCORE
+PROXY_IS_LOW_SPEC=$PROXY_IS_LOW_SPEC
+PROXY_CHAIN_ARCH=$PROXY_CHAIN_ARCH
+PROXY_NODE_ROLE=$PROXY_NODE_ROLE
+PROXY_SERVER_LOCATION=$PROXY_SERVER_LOCATION
+PROXY_CLIENT_LOCATION=$PROXY_CLIENT_LOCATION
+PROXY_LINE_TYPE=$PROXY_LINE_TYPE
+PROXY_KERNEL=$PROXY_KERNEL
+PROXY_PROTOCOL=$PROXY_PROTOCOL
+PROXY_RESOURCE_RATIO=$PROXY_RESOURCE_RATIO
+PROXY_ADVANCED_OPTS=$PROXY_ADVANCED_OPTS
+EOF
+    print_info "配置已保存到: $PROXY_PROFILE_FILE"
+}
+
+# 加载代理配置
+load_proxy_profile() {
+    if [[ -f "$PROXY_PROFILE_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$PROXY_PROFILE_FILE"
+        return 0
+    fi
+    return 1
+}
+
+# 查看当前优化方案
+show_current_optimization() {
+    print_header "当前优化方案"
+    echo
+    
+    # 检查是否有配置文件
+    if [[ ! -f "$SYSCTL_FILE" ]]; then
+        print_warn "未找到优化配置文件: $SYSCTL_FILE"
+        print_info "尚未应用任何优化"
+        echo
+        read -rp "按 Enter 键继续..."
+        return
+    fi
+    
+    # 显示配置文件头部信息
+    echo -e "  ${BOLD}📋 配置文件信息${NC}"
+    print_separator
+    printf "    %-15s : %s\n" "配置文件" "$SYSCTL_FILE"
+    printf "    %-15s : %s\n" "修改时间" "$(stat -c '%y' "$SYSCTL_FILE" 2>/dev/null | cut -d. -f1 || echo '未知')"
+    echo
+    
+    # 如果有代理配置文件，显示代理配置信息
+    if [[ -f "$PROXY_PROFILE_FILE" ]]; then
+        echo -e "  ${BOLD}🚀 代理调优配置${NC}"
+        print_separator
+        # shellcheck source=/dev/null
+        source "$PROXY_PROFILE_FILE" 2>/dev/null
+        printf "    %-15s : %s/100\n" "硬件评分" "${PROXY_HARDWARE_SCORE:-未知}"
+        printf "    %-15s : %s\n" "链路架构" "${PROXY_CHAIN_ARCH:-未知}"
+        printf "    %-15s : %s\n" "节点角色" "${PROXY_NODE_ROLE:-未知}"
+        printf "    %-15s : %s\n" "服务器位置" "${PROXY_SERVER_LOCATION:-未知}"
+        printf "    %-15s : %s\n" "客户端位置" "${PROXY_CLIENT_LOCATION:-未知}"
+        printf "    %-15s : %s\n" "线路类型" "${PROXY_LINE_TYPE:-未知}"
+        printf "    %-15s : %s\n" "代理内核" "${PROXY_KERNEL:-未知}"
+        printf "    %-15s : %s\n" "代理协议" "${PROXY_PROTOCOL:-未知}"
+        printf "    %-15s : %s%%\n" "资源占比" "${PROXY_RESOURCE_RATIO:-100}"
+        printf "    %-15s : %s\n" "高级优化" "${PROXY_ADVANCED_OPTS:-none}"
+        echo
+    fi
+    
+    # 显示当前生效的关键参数
+    echo -e "  ${BOLD}⚙️ 当前生效的优化参数${NC}"
+    print_separator
+    echo
+    
+    # 拥塞控制
+    echo "    【拥塞控制】"
+    local current_algo current_qdisc
+    current_algo=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    printf "      %-20s : %s\n" "拥塞算法" "$current_algo"
+    printf "      %-20s : %s\n" "队列调度" "$current_qdisc"
+    echo
+    
+    # 缓冲区设置
+    echo "    【缓冲区设置】"
+    local rmem_max wmem_max
+    rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "未知")
+    wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null || echo "未知")
+    printf "      %-20s : %s bytes (%s MB)\n" "rmem_max" "$rmem_max" "$((rmem_max / 1024 / 1024))"
+    printf "      %-20s : %s bytes (%s MB)\n" "wmem_max" "$wmem_max" "$((wmem_max / 1024 / 1024))"
+    echo
+    
+    # TCP 优化
+    echo "    【TCP 优化】"
+    local tfo ecn sack notsent_lowat
+    tfo=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "未知")
+    ecn=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null || echo "未知")
+    sack=$(sysctl -n net.ipv4.tcp_sack 2>/dev/null || echo "未知")
+    notsent_lowat=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo "未知")
+    printf "      %-20s : %s\n" "TCP Fast Open" "$tfo"
+    printf "      %-20s : %s\n" "TCP ECN" "$ecn"
+    printf "      %-20s : %s\n" "TCP SACK" "$sack"
+    printf "      %-20s : %s\n" "notsent_lowat" "$notsent_lowat"
+    echo
+    
+    # 连接设置
+    echo "    【连接设置】"
+    local somaxconn tw_reuse fin_timeout keepalive
+    somaxconn=$(sysctl -n net.core.somaxconn 2>/dev/null || echo "未知")
+    tw_reuse=$(sysctl -n net.ipv4.tcp_tw_reuse 2>/dev/null || echo "未知")
+    fin_timeout=$(sysctl -n net.ipv4.tcp_fin_timeout 2>/dev/null || echo "未知")
+    keepalive=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo "未知")
+    printf "      %-20s : %s\n" "somaxconn" "$somaxconn"
+    printf "      %-20s : %s\n" "tw_reuse" "$tw_reuse"
+    printf "      %-20s : %s 秒\n" "fin_timeout" "$fin_timeout"
+    printf "      %-20s : %s 秒\n" "keepalive_time" "$keepalive"
+    echo
+    
+    # 系统服务状态
+    echo "    【系统服务】"
+    local irq_status="未安装"
+    local haveged_status="未安装"
+    if command -v irqbalance &>/dev/null; then
+        systemctl is-active irqbalance >/dev/null 2>&1 && irq_status="运行中" || irq_status="已安装但未运行"
+    fi
+    if command -v haveged &>/dev/null; then
+        systemctl is-active haveged >/dev/null 2>&1 && haveged_status="运行中" || haveged_status="已安装但未运行"
+    fi
+    printf "      %-20s : %s\n" "irqbalance" "$irq_status"
+    printf "      %-20s : %s\n" "haveged" "$haveged_status"
+    echo
+    
+    # 显示完整配置文件内容
+    echo -e "  ${BOLD}📄 完整配置文件内容${NC}"
+    print_separator
+    echo
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        echo "    $line"
+    done < "$SYSCTL_FILE"
+    echo
+    
+    read -rp "按 Enter 键继续..."
+}
+
+# 恢复默认配置
+restore_default_config() {
+    print_header "恢复默认配置"
+    echo
+    
+    echo -e "  ${YELLOW}${ICON_WARN} 警告: 此操作将恢复系统默认的网络参数${NC}"
+    echo
+    echo "  将要执行的操作:"
+    echo "    1. 删除 BBR 优化配置文件"
+    echo "    2. 删除代理调优配置文件"
+    echo "    3. 恢复系统默认 sysctl 参数"
+    echo "    4. 停止并禁用 irqbalance/haveged（如果由脚本安装）"
+    echo
+    
+    if ! confirm "确认恢复默认配置？此操作不可撤销！" "n"; then
+        print_info "已取消操作"
+        read -rp "按 Enter 键继续..."
+        return
+    fi
+    
+    echo
+    print_step "[1/4] 备份当前配置..."
+    if [[ -f "$SYSCTL_FILE" ]]; then
+        local backup_file="${BACKUP_DIR}/99-bbr.conf.restore.$(date +%Y%m%d%H%M%S)"
+        mkdir -p "$BACKUP_DIR"
+        cp "$SYSCTL_FILE" "$backup_file"
+        print_success "配置已备份到: $backup_file"
+    else
+        print_info "无需备份（配置文件不存在）"
+    fi
+    
+    print_step "[2/4] 删除配置文件..."
+    if [[ -f "$SYSCTL_FILE" ]]; then
+        rm -f "$SYSCTL_FILE"
+        print_success "已删除: $SYSCTL_FILE"
+    fi
+    if [[ -f "$PROXY_PROFILE_FILE" ]]; then
+        rm -f "$PROXY_PROFILE_FILE"
+        print_success "已删除: $PROXY_PROFILE_FILE"
+    fi
+    
+    print_step "[3/4] 恢复系统默认参数..."
+    
+    # 恢复关键参数到系统默认值
+    local default_params=(
+        "net.ipv4.tcp_congestion_control=cubic"
+        "net.core.default_qdisc=fq_codel"
+        "net.core.rmem_max=212992"
+        "net.core.wmem_max=212992"
+        "net.core.somaxconn=4096"
+        "net.ipv4.tcp_fastopen=1"
+        "net.ipv4.tcp_tw_reuse=2"
+        "net.ipv4.tcp_fin_timeout=60"
+        "net.ipv4.tcp_keepalive_time=7200"
+        "net.ipv4.tcp_ecn=2"
+        "net.ipv4.tcp_sack=1"
+        "net.ipv4.tcp_notsent_lowat=4294967295"
+    )
+    
+    for param in "${default_params[@]}"; do
+        sysctl -w "$param" >/dev/null 2>&1 || true
+    done
+    print_success "系统参数已恢复默认值"
+    
+    print_step "[4/4] 重新加载系统配置..."
+    sysctl --system >/dev/null 2>&1 || true
+    print_success "系统配置已重新加载"
+    
+    echo
+    echo -e "  ${BOLD}${GREEN}${ICON_OK} 恢复完成！${NC}"
+    echo
+    echo -e "  ${BOLD}当前状态:${NC}"
+    printf "    %-15s : %s\n" "拥塞控制" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    printf "    %-15s : %s\n" "队列调度" "$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+    echo
+    print_info "如需重新优化，请运行代理智能调优向导"
+    echo
+    
+    read -rp "按 Enter 键继续..."
+}
+
+# 代理调优向导主入口
+proxy_tune_wizard() {
+    print_header "代理服务器智能调优向导"
+    
+    # 检查是否有已保存的配置
+    if load_proxy_profile; then
+        echo
+        print_info "检测到已保存的配置"
+        echo
+        printf "    %-15s : %s\n" "节点角色" "$PROXY_NODE_ROLE"
+        printf "    %-15s : %s\n" "代理协议" "$PROXY_PROTOCOL"
+        printf "    %-15s : %s\n" "线路类型" "$PROXY_LINE_TYPE"
+        echo
+        
+        if confirm "是否使用已保存的配置？" "y"; then
+            show_optimization_plan
+            if confirm "确认应用此优化方案？" "y"; then
+                execute_optimization
+                read -rp "按 Enter 键继续..."
+                return
+            fi
+        fi
+    fi
+    
+    # 步骤 1: 硬件检测
+    echo
+    print_step "第一步：检测硬件"
+    show_hardware_report
+    
+    # 步骤 2: 内核检测
+    print_step "第二步：内核检测"
+    if ! check_current_kernel; then
+        if confirm "是否现在安装 BBR3 内核？" "n"; then
+            show_kernel_menu
+        fi
+    fi
+    
+    # 步骤 3-7: 收集信息
+    print_step "第三步：链路架构"
+    ask_chain_architecture
+    
+    print_step "第四步：位置信息"
+    ask_server_location
+    ask_client_location
+    
+    print_step "第五步：线路类型"
+    ask_line_type
+    
+    print_step "第六步：代理内核"
+    ask_proxy_kernel
+    
+    print_step "第七步：代理协议"
+    ask_proxy_protocol
+    
+    print_step "第八步：资源分配"
+    ask_resource_ratio
+    
+    print_step "第九步：高级优化"
+    ask_advanced_optimization
+    
+    # 步骤 10: 显示方案
+    print_step "第十步：生成优化方案"
+    show_optimization_plan
+    
+    # 确认并执行
+    if confirm "确认应用此优化方案？" "y"; then
+        execute_optimization
+    else
+        print_info "已取消操作"
+    fi
+    
+    echo
+    read -rp "按 Enter 键继续..."
+}
+
+#===============================================================================
+# 优化验证系统
+#===============================================================================
+
+# 验证结果存储
+VERIFY_KERNEL_STATUS=0
+VERIFY_ALGO_STATUS=0
+VERIFY_QDISC_STATUS=0
+VERIFY_BUFFER_STATUS=0
+VERIFY_TCP_STATUS=0
+VERIFY_SERVICE_STATUS=0
+VERIFY_ISSUES=()
+VERIFY_FIXES=()
+
+# 验证 BBR3 内核
+verify_kernel_bbr3() {
+    local kernel_version
+    kernel_version=$(uname -r)
+    
+    local available_algos
+    available_algos=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || echo "")
+    
+    local current_algo
+    current_algo=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    
+    echo -e "  ${BOLD}内核验证${NC}"
+    print_separator
+    echo
+    
+    # 检查内核版本
+    printf "    %-25s : %s\n" "内核版本" "$kernel_version"
+    
+    # 检查 BBR3 可用性
+    local bbr3_available=false
+    local bbr_available=false
+    
+    if echo "$available_algos" | grep -q "bbr3"; then
+        bbr3_available=true
+    fi
+    if echo "$available_algos" | grep -q "bbr"; then
+        bbr_available=true
+    fi
+    
+    # 判断状态
+    if [[ "$current_algo" == "bbr3" ]]; then
+        printf "    %-25s : ${GREEN}✅ BBR3 已启用${NC}\n" "拥塞控制"
+        VERIFY_KERNEL_STATUS=100
+    elif [[ "$current_algo" == "bbr" ]]; then
+        # 检查是否是 6.9+ 内核的 BBR3
+        local kver_short
+        kver_short=$(echo "$kernel_version" | sed 's/[^0-9.].*$//')
+        if version_ge "$kver_short" "6.9.0"; then
+            printf "    %-25s : ${GREEN}✅ BBR3 已启用 (内核内置)${NC}\n" "拥塞控制"
+            VERIFY_KERNEL_STATUS=100
+        else
+            printf "    %-25s : ${YELLOW}⚠️ BBR 已启用 (非 BBR3)${NC}\n" "拥塞控制"
+            VERIFY_KERNEL_STATUS=70
+            VERIFY_ISSUES+=("BBR 已启用但非 BBR3 版本")
+            VERIFY_FIXES+=("升级内核到 6.9+ 或安装 XanMod 内核")
+        fi
+    elif [[ "$bbr3_available" == "true" ]] || [[ "$bbr_available" == "true" ]]; then
+        printf "    %-25s : ${YELLOW}⚠️ BBR 可用但未启用 (当前: $current_algo)${NC}\n" "拥塞控制"
+        VERIFY_KERNEL_STATUS=30
+        VERIFY_ISSUES+=("BBR 可用但未启用")
+        VERIFY_FIXES+=("运行脚本应用优化配置")
+    else
+        printf "    %-25s : ${RED}❌ BBR 不可用 (当前: $current_algo)${NC}\n" "拥塞控制"
+        VERIFY_KERNEL_STATUS=0
+        VERIFY_ISSUES+=("内核不支持 BBR")
+        VERIFY_FIXES+=("安装支持 BBR3 的内核 (XanMod/Liquorix/ELRepo)")
+    fi
+    
+    # 显示可用算法
+    printf "    %-25s : %s\n" "可用算法" "$available_algos"
+    echo
+    
+    return $([[ $VERIFY_KERNEL_STATUS -ge 70 ]] && echo 0 || echo 1)
+}
+
+# 验证内核模块
+verify_kernel_modules() {
+    echo -e "  ${BOLD}模块状态${NC}"
+    print_separator
+    echo
+    
+    local tcp_bbr_loaded=false
+    local sch_fq_loaded=false
+    
+    if lsmod 2>/dev/null | grep -q "tcp_bbr"; then
+        tcp_bbr_loaded=true
+        printf "    %-25s : ${GREEN}✅ 已加载${NC}\n" "tcp_bbr"
+    else
+        # 可能是内核内置
+        if [[ -f /proc/sys/net/ipv4/tcp_available_congestion_control ]]; then
+            if grep -q "bbr" /proc/sys/net/ipv4/tcp_available_congestion_control; then
+                printf "    %-25s : ${GREEN}✅ 内核内置${NC}\n" "tcp_bbr"
+                tcp_bbr_loaded=true
+            else
+                printf "    %-25s : ${YELLOW}⚠️ 未加载${NC}\n" "tcp_bbr"
+            fi
+        fi
+    fi
+    
+    if lsmod 2>/dev/null | grep -q "sch_fq"; then
+        printf "    %-25s : ${GREEN}✅ 已加载${NC}\n" "sch_fq"
+        sch_fq_loaded=true
+    else
+        if tc qdisc show 2>/dev/null | grep -q "fq"; then
+            printf "    %-25s : ${GREEN}✅ 内核内置${NC}\n" "sch_fq"
+            sch_fq_loaded=true
+        else
+            printf "    %-25s : ${DIM}未加载${NC}\n" "sch_fq"
+        fi
+    fi
+    echo
+}
+
+# 验证拥塞控制和队列
+verify_congestion_control() {
+    local current_algo current_qdisc
+    current_algo=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
+    
+    echo -e "  ${BOLD}拥塞控制验证${NC}"
+    print_separator
+    echo
+    
+    # 检查算法
+    if [[ "$current_algo" == "bbr3" ]] || [[ "$current_algo" == "bbr" ]]; then
+        printf "    %-25s : ${GREEN}✅ %s${NC}\n" "拥塞算法" "$current_algo"
+        VERIFY_ALGO_STATUS=100
+    elif [[ "$current_algo" == "cubic" ]]; then
+        printf "    %-25s : ${YELLOW}⚠️ %s (默认值)${NC}\n" "拥塞算法" "$current_algo"
+        VERIFY_ALGO_STATUS=50
+        VERIFY_ISSUES+=("使用默认 CUBIC 算法而非 BBR")
+        VERIFY_FIXES+=("运行优化配置启用 BBR")
+    else
+        printf "    %-25s : ${DIM}%s${NC}\n" "拥塞算法" "$current_algo"
+        VERIFY_ALGO_STATUS=30
+    fi
+    
+    # 检查队列
+    if [[ "$current_qdisc" == "fq" ]] || [[ "$current_qdisc" == "fq_codel" ]] || [[ "$current_qdisc" == "cake" ]]; then
+        printf "    %-25s : ${GREEN}✅ %s${NC}\n" "队列调度" "$current_qdisc"
+        VERIFY_QDISC_STATUS=100
+    else
+        printf "    %-25s : ${YELLOW}⚠️ %s${NC}\n" "队列调度" "$current_qdisc"
+        VERIFY_QDISC_STATUS=50
+        VERIFY_ISSUES+=("队列调度未优化")
+        VERIFY_FIXES+=("设置 default_qdisc 为 fq 或 cake")
+    fi
+    echo
+}
+
+# 验证缓冲区设置
+verify_buffer_settings() {
+    local rmem_max wmem_max
+    rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+    wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)
+    
+    echo -e "  ${BOLD}缓冲区验证${NC}"
+    print_separator
+    echo
+    
+    # 检查接收缓冲区
+    if [[ $rmem_max -ge $BUFFER_16MB ]]; then
+        printf "    %-25s : ${GREEN}✅ %s MB${NC}\n" "rmem_max" "$((rmem_max / 1024 / 1024))"
+        VERIFY_BUFFER_STATUS=$((VERIFY_BUFFER_STATUS + 50))
+    elif [[ $rmem_max -ge 1048576 ]]; then
+        printf "    %-25s : ${YELLOW}⚠️ %s MB (偏小)${NC}\n" "rmem_max" "$((rmem_max / 1024 / 1024))"
+        VERIFY_BUFFER_STATUS=$((VERIFY_BUFFER_STATUS + 25))
+        VERIFY_ISSUES+=("rmem_max 偏小")
+        VERIFY_FIXES+=("增大 rmem_max 到 16MB 以上")
+    else
+        printf "    %-25s : ${RED}❌ %s bytes (过小)${NC}\n" "rmem_max" "$rmem_max"
+        VERIFY_ISSUES+=("rmem_max 过小")
+        VERIFY_FIXES+=("设置 rmem_max 至少 16MB")
+    fi
+    
+    # 检查发送缓冲区
+    if [[ $wmem_max -ge $BUFFER_16MB ]]; then
+        printf "    %-25s : ${GREEN}✅ %s MB${NC}\n" "wmem_max" "$((wmem_max / 1024 / 1024))"
+        VERIFY_BUFFER_STATUS=$((VERIFY_BUFFER_STATUS + 50))
+    elif [[ $wmem_max -ge 1048576 ]]; then
+        printf "    %-25s : ${YELLOW}⚠️ %s MB (偏小)${NC}\n" "wmem_max" "$((wmem_max / 1024 / 1024))"
+        VERIFY_BUFFER_STATUS=$((VERIFY_BUFFER_STATUS + 25))
+        VERIFY_ISSUES+=("wmem_max 偏小")
+        VERIFY_FIXES+=("增大 wmem_max 到 16MB 以上")
+    else
+        printf "    %-25s : ${RED}❌ %s bytes (过小)${NC}\n" "wmem_max" "$wmem_max"
+        VERIFY_ISSUES+=("wmem_max 过小")
+        VERIFY_FIXES+=("设置 wmem_max 至少 16MB")
+    fi
+    echo
+}
+
+# 验证 TCP 参数
+verify_tcp_params() {
+    local tfo tw_reuse fin_timeout
+    tfo=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo 0)
+    tw_reuse=$(sysctl -n net.ipv4.tcp_tw_reuse 2>/dev/null || echo 0)
+    fin_timeout=$(sysctl -n net.ipv4.tcp_fin_timeout 2>/dev/null || echo 60)
+    
+    echo -e "  ${BOLD}TCP 参数验证${NC}"
+    print_separator
+    echo
+    
+    VERIFY_TCP_STATUS=0
+    local tcp_checks=0
+    
+    # TCP Fast Open
+    if [[ $tfo -ge 3 ]]; then
+        printf "    %-25s : ${GREEN}✅ %s (客户端+服务端)${NC}\n" "TCP Fast Open" "$tfo"
+        VERIFY_TCP_STATUS=$((VERIFY_TCP_STATUS + 25))
+    elif [[ $tfo -ge 1 ]]; then
+        printf "    %-25s : ${YELLOW}⚠️ %s (仅部分启用)${NC}\n" "TCP Fast Open" "$tfo"
+        VERIFY_TCP_STATUS=$((VERIFY_TCP_STATUS + 10))
+        VERIFY_ISSUES+=("TCP Fast Open 仅部分启用")
+        VERIFY_FIXES+=("设置 tcp_fastopen=3 启用双向")
+    else
+        printf "    %-25s : ${DIM}%s (未启用)${NC}\n" "TCP Fast Open" "$tfo"
+    fi
+    
+    # TIME_WAIT 复用
+    if [[ $tw_reuse -ge 1 ]]; then
+        printf "    %-25s : ${GREEN}✅ 已启用${NC}\n" "TIME_WAIT 复用"
+        VERIFY_TCP_STATUS=$((VERIFY_TCP_STATUS + 25))
+    else
+        printf "    %-25s : ${DIM}未启用${NC}\n" "TIME_WAIT 复用"
+    fi
+    
+    # FIN 超时
+    if [[ $fin_timeout -le 30 ]]; then
+        printf "    %-25s : ${GREEN}✅ %s 秒${NC}\n" "FIN 超时" "$fin_timeout"
+        VERIFY_TCP_STATUS=$((VERIFY_TCP_STATUS + 25))
+    elif [[ $fin_timeout -le 60 ]]; then
+        printf "    %-25s : ${YELLOW}⚠️ %s 秒 (默认值)${NC}\n" "FIN 超时" "$fin_timeout"
+        VERIFY_TCP_STATUS=$((VERIFY_TCP_STATUS + 15))
+    else
+        printf "    %-25s : ${DIM}%s 秒${NC}\n" "FIN 超时" "$fin_timeout"
+    fi
+    
+    # 慢启动
+    local slow_start
+    slow_start=$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo 1)
+    if [[ $slow_start -eq 0 ]]; then
+        printf "    %-25s : ${GREEN}✅ 已禁用 (重连更快)${NC}\n" "慢启动"
+        VERIFY_TCP_STATUS=$((VERIFY_TCP_STATUS + 25))
+    else
+        printf "    %-25s : ${DIM}默认${NC}\n" "慢启动"
+    fi
+    echo
+}
+
+# 验证系统服务
+verify_system_services() {
+    echo -e "  ${BOLD}系统服务验证${NC}"
+    print_separator
+    echo
+    
+    VERIFY_SERVICE_STATUS=0
+    
+    # irqbalance
+    if command -v irqbalance &>/dev/null; then
+        if systemctl is-active irqbalance >/dev/null 2>&1; then
+            printf "    %-25s : ${GREEN}✅ 运行中${NC}\n" "irqbalance"
+            VERIFY_SERVICE_STATUS=$((VERIFY_SERVICE_STATUS + 50))
+        else
+            printf "    %-25s : ${YELLOW}⚠️ 已安装但未运行${NC}\n" "irqbalance"
+            VERIFY_SERVICE_STATUS=$((VERIFY_SERVICE_STATUS + 25))
+            VERIFY_ISSUES+=("irqbalance 未运行")
+            VERIFY_FIXES+=("运行 systemctl start irqbalance")
+        fi
+    else
+        printf "    %-25s : ${DIM}未安装${NC}\n" "irqbalance"
+    fi
+    
+    # haveged
+    if command -v haveged &>/dev/null; then
+        if systemctl is-active haveged >/dev/null 2>&1; then
+            printf "    %-25s : ${GREEN}✅ 运行中${NC}\n" "haveged"
+            VERIFY_SERVICE_STATUS=$((VERIFY_SERVICE_STATUS + 50))
+        else
+            printf "    %-25s : ${YELLOW}⚠️ 已安装但未运行${NC}\n" "haveged"
+            VERIFY_SERVICE_STATUS=$((VERIFY_SERVICE_STATUS + 25))
+            VERIFY_ISSUES+=("haveged 未运行")
+            VERIFY_FIXES+=("运行 systemctl start haveged")
+        fi
+    else
+        printf "    %-25s : ${DIM}未安装${NC}\n" "haveged"
+    fi
+    echo
+}
+
+# 验证网络接口队列
+verify_network_interface() {
+    echo -e "  ${BOLD}网络接口验证${NC}"
+    print_separator
+    echo
+    
+    local default_if
+    default_if=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
+    
+    if [[ -n "$default_if" ]]; then
+        printf "    %-25s : %s\n" "默认网卡" "$default_if"
+        
+        local qdisc_info
+        qdisc_info=$(tc qdisc show dev "$default_if" 2>/dev/null | head -1)
+        
+        if echo "$qdisc_info" | grep -qE "fq|cake|fq_codel"; then
+            printf "    %-25s : ${GREEN}✅ %s${NC}\n" "队列规则" "$(echo "$qdisc_info" | awk '{print $2}')"
+        else
+            printf "    %-25s : ${DIM}%s${NC}\n" "队列规则" "$(echo "$qdisc_info" | awk '{print $2}')"
+        fi
+    else
+        printf "    %-25s : ${YELLOW}⚠️ 无法检测${NC}\n" "默认网卡"
+    fi
+    echo
+}
+
+# 检查配置完整性
+check_config_integrity() {
+    echo -e "  ${BOLD}配置文件验证${NC}"
+    print_separator
+    echo
+    
+    local config_ok=true
+    
+    # 检查主配置文件
+    if [[ -f "$SYSCTL_FILE" ]]; then
+        printf "    %-25s : ${GREEN}✅ 存在${NC}\n" "sysctl 配置"
+        
+        # 检查语法
+        if sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1; then
+            printf "    %-25s : ${GREEN}✅ 有效${NC}\n" "配置语法"
+        else
+            printf "    %-25s : ${YELLOW}⚠️ 部分参数无效${NC}\n" "配置语法"
+            config_ok=false
+            VERIFY_ISSUES+=("配置文件部分参数无效")
+            VERIFY_FIXES+=("检查 $SYSCTL_FILE 中的参数")
+        fi
+    else
+        printf "    %-25s : ${RED}❌ 不存在${NC}\n" "sysctl 配置"
+        config_ok=false
+        VERIFY_ISSUES+=("优化配置文件不存在")
+        VERIFY_FIXES+=("运行优化向导生成配置")
+    fi
+    
+    # 检查代理配置文件
+    if [[ -f "$PROXY_PROFILE_FILE" ]]; then
+        printf "    %-25s : ${GREEN}✅ 存在${NC}\n" "代理配置"
+    else
+        printf "    %-25s : ${DIM}不存在${NC}\n" "代理配置"
+    fi
+    echo
+    
+    [[ "$config_ok" == "true" ]]
+}
+
+# 计算健康评分
+calculate_health_score() {
+    local total_score=0
+    local weight_kernel=30
+    local weight_algo=20
+    local weight_buffer=20
+    local weight_tcp=15
+    local weight_service=15
+    
+    total_score=$((
+        VERIFY_KERNEL_STATUS * weight_kernel / 100 +
+        VERIFY_ALGO_STATUS * weight_algo / 100 +
+        VERIFY_BUFFER_STATUS * weight_buffer / 100 +
+        VERIFY_TCP_STATUS * weight_tcp / 100 +
+        VERIFY_SERVICE_STATUS * weight_service / 100
+    ))
+    
+    echo "$total_score"
+}
+
+# 获取健康评价
+get_health_rating() {
+    local score=$1
+    
+    if [[ $score -ge 90 ]]; then
+        echo "优秀"
+    elif [[ $score -ge 70 ]]; then
+        echo "良好"
+    elif [[ $score -ge 50 ]]; then
+        echo "一般"
+    elif [[ $score -ge 30 ]]; then
+        echo "较差"
+    else
+        echo "需要优化"
+    fi
+}
+
+# 生成诊断报告
+generate_diagnostic_report() {
+    # 重置状态
+    VERIFY_KERNEL_STATUS=0
+    VERIFY_ALGO_STATUS=0
+    VERIFY_QDISC_STATUS=0
+    VERIFY_BUFFER_STATUS=0
+    VERIFY_TCP_STATUS=0
+    VERIFY_SERVICE_STATUS=0
+    VERIFY_ISSUES=()
+    VERIFY_FIXES=()
+    
+    print_header "优化验证报告"
+    echo
+    
+    # 执行所有验证
+    verify_kernel_bbr3
+    verify_kernel_modules
+    verify_congestion_control
+    verify_buffer_settings
+    verify_tcp_params
+    verify_system_services
+    verify_network_interface
+    check_config_integrity
+    
+    # 计算健康评分
+    local health_score
+    health_score=$(calculate_health_score)
+    local health_rating
+    health_rating=$(get_health_rating "$health_score")
+    
+    # 显示健康评分
+    echo -e "  ${BOLD}健康评分${NC}"
+    print_separator
+    echo
+    
+    local score_color
+    if [[ $health_score -ge 70 ]]; then
+        score_color="${GREEN}"
+    elif [[ $health_score -ge 50 ]]; then
+        score_color="${YELLOW}"
+    else
+        score_color="${RED}"
+    fi
+    
+    printf "    ${BOLD}评分: ${score_color}%d/100${NC} (%s)\n" "$health_score" "$health_rating"
+    echo
+    
+    # 显示问题和修复建议
+    if [[ ${#VERIFY_ISSUES[@]} -gt 0 ]]; then
+        echo -e "  ${BOLD}发现的问题${NC}"
+        print_separator
+        echo
+        for i in "${!VERIFY_ISSUES[@]}"; do
+            printf "    ${YELLOW}⚠️ %s${NC}\n" "${VERIFY_ISSUES[$i]}"
+            printf "       ${DIM}修复: %s${NC}\n" "${VERIFY_FIXES[$i]}"
+        done
+        echo
+    else
+        echo -e "  ${GREEN}${ICON_OK} 未发现问题，所有优化已生效！${NC}"
+        echo
+    fi
+}
+
+# 显示验证菜单
+show_verification_menu() {
+    while true; do
+        print_header "优化验证"
+        echo
+        echo -e "  ${CYAN}1)${NC} 完整验证报告    - 检查所有优化项"
+        echo -e "  ${CYAN}2)${NC} 内核验证        - 检查 BBR3 状态"
+        echo -e "  ${CYAN}3)${NC} 参数验证        - 检查 sysctl 参数"
+        echo -e "  ${CYAN}4)${NC} 服务验证        - 检查系统服务"
+        echo -e "  ${CYAN}5)${NC} 健康评分        - 仅显示评分"
+        echo
+        echo -e "  ${CYAN}0)${NC} 返回"
+        echo
+        
+        read_choice "请选择" 5
+        
+        case "$MENU_CHOICE" in
+            0) return ;;
+            1) generate_diagnostic_report ;;
+            2) 
+                VERIFY_KERNEL_STATUS=0
+                VERIFY_ISSUES=()
+                VERIFY_FIXES=()
+                print_header "内核验证"
+                echo
+                verify_kernel_bbr3
+                verify_kernel_modules
+                ;;
+            3)
+                VERIFY_ALGO_STATUS=0
+                VERIFY_BUFFER_STATUS=0
+                VERIFY_TCP_STATUS=0
+                VERIFY_ISSUES=()
+                VERIFY_FIXES=()
+                print_header "参数验证"
+                echo
+                verify_congestion_control
+                verify_buffer_settings
+                verify_tcp_params
+                ;;
+            4)
+                VERIFY_SERVICE_STATUS=0
+                VERIFY_ISSUES=()
+                VERIFY_FIXES=()
+                print_header "服务验证"
+                echo
+                verify_system_services
+                verify_network_interface
+                ;;
+            5)
+                VERIFY_KERNEL_STATUS=0
+                VERIFY_ALGO_STATUS=0
+                VERIFY_BUFFER_STATUS=0
+                VERIFY_TCP_STATUS=0
+                VERIFY_SERVICE_STATUS=0
+                VERIFY_ISSUES=()
+                VERIFY_FIXES=()
+                # 静默执行验证
+                verify_kernel_bbr3 >/dev/null 2>&1
+                verify_congestion_control >/dev/null 2>&1
+                verify_buffer_settings >/dev/null 2>&1
+                verify_tcp_params >/dev/null 2>&1
+                verify_system_services >/dev/null 2>&1
+                local score
+                score=$(calculate_health_score)
+                local rating
+                rating=$(get_health_rating "$score")
+                echo
+                echo -e "  健康评分: ${BOLD}${score}/100${NC} ($rating)"
+                echo
+                ;;
+        esac
+        
+        read -rp "按 Enter 键继续..."
+    done
+}
+
+# 快速验证（命令行用）
+quick_verify() {
+    VERIFY_KERNEL_STATUS=0
+    VERIFY_ALGO_STATUS=0
+    VERIFY_BUFFER_STATUS=0
+    VERIFY_TCP_STATUS=0
+    VERIFY_SERVICE_STATUS=0
+    VERIFY_ISSUES=()
+    VERIFY_FIXES=()
+    
+    # 静默执行验证
+    verify_kernel_bbr3 >/dev/null 2>&1
+    verify_congestion_control >/dev/null 2>&1
+    verify_buffer_settings >/dev/null 2>&1
+    verify_tcp_params >/dev/null 2>&1
+    verify_system_services >/dev/null 2>&1
+    
+    local score
+    score=$(calculate_health_score)
+    local rating
+    rating=$(get_health_rating "$score")
+    
+    local algo qdisc
+    algo=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
+    
+    echo "HEALTH_SCORE=$score"
+    echo "HEALTH_RATING=$rating"
+    echo "ALGO=$algo"
+    echo "QDISC=$qdisc"
+    echo "ISSUES=${#VERIFY_ISSUES[@]}"
+    
+    [[ $score -ge 70 ]]
+}
+
 # 场景配置菜单
 scene_config_menu() {
     # 检测服务器资源并推荐模式
@@ -1984,29 +3636,38 @@ scene_config_menu() {
         
         print_separator
         echo
-        echo -e "  ${CYAN}1)${NC} 均衡模式    - 平衡延迟与吞吐量，适合一般用途"
-        echo -e "  ${CYAN}2)${NC} 通信模式    - 优化低延迟，适合实时通信/游戏"
-        echo -e "  ${CYAN}3)${NC} 视频模式    - 优化大文件传输，适合视频流/下载"
-        echo -e "  ${CYAN}4)${NC} 并发模式    - 优化高并发，适合 Web/API 服务器"
-        echo -e "  ${CYAN}5)${NC} 极速模式    - 最大化吞吐量，适合大带宽服务器"
-        echo -e "  ${CYAN}6)${NC} 性能模式    - 全面性能优化，适合高性能计算"
-        echo -e "  ${GREEN}7)${NC} ${GREEN}代理模式${NC}    - ${GREEN}专为代理/VPN优化，推荐翻墙使用${NC}"
+        echo -e "  ${GREEN}${BOLD}1)${NC} ${GREEN}🚀 代理智能调优${NC} - ${GREEN}推荐翻墙用户！10步向导，自动生成最优配置${NC}"
+        echo -e "  ${CYAN}2)${NC} 📋 查看当前优化  - 查看已应用的所有优化参数"
+        echo -e "  ${CYAN}3)${NC} ✅ 验证优化状态  - 检测优化是否生效"
+        echo -e "  ${CYAN}4)${NC} 🔄 恢复默认配置  - 恢复系统默认网络参数"
+        echo
+        print_separator
+        echo -e "  ${DIM}以下为通用预设模式（非翻墙用途）:${NC}"
+        echo -e "  ${CYAN}5)${NC} 均衡模式    - 平衡延迟与吞吐量，适合一般用途"
+        echo -e "  ${CYAN}6)${NC} 通信模式    - 优化低延迟，适合实时通信/游戏"
+        echo -e "  ${CYAN}7)${NC} 视频模式    - 优化大文件传输，适合视频流/下载"
+        echo -e "  ${CYAN}8)${NC} 并发模式    - 优化高并发，适合 Web/API 服务器"
+        echo -e "  ${CYAN}9)${NC} 极速模式    - 最大化吞吐量，适合大带宽服务器"
+        echo -e "  ${CYAN}10)${NC} 性能模式   - 全面性能优化，适合高性能计算"
         echo
         echo -e "  ${CYAN}0)${NC} 返回主菜单"
         echo
         
-        read_choice "请选择场景模式" 7
+        read_choice "请选择场景模式" 10
         
         local selected_mode=""
         case "$MENU_CHOICE" in
             0) return ;;
-            1) selected_mode="balanced" ;;
-            2) selected_mode="communication" ;;
-            3) selected_mode="video" ;;
-            4) selected_mode="concurrent" ;;
-            5) selected_mode="speed" ;;
-            6) selected_mode="performance" ;;
-            7) selected_mode="proxy" ;;
+            1) proxy_tune_wizard; continue ;;
+            2) show_current_optimization; continue ;;
+            3) show_verification_menu; continue ;;
+            4) restore_default_config; continue ;;
+            5) selected_mode="balanced" ;;
+            6) selected_mode="communication" ;;
+            7) selected_mode="video" ;;
+            8) selected_mode="concurrent" ;;
+            9) selected_mode="speed" ;;
+            10) selected_mode="performance" ;;
             *) continue ;;
         esac
         
@@ -3212,50 +4873,6 @@ detect_cpu_level() {
     echo "$level"
 }
 
-
-
-# 从 GitHub 下载 XanMod deb 包
-download_xanmod_from_github() {
-    local tmp_dir="/tmp/xanmod-install-$$"
-    mkdir -p "$tmp_dir"
-    
-    print_step "从 GitHub 获取 XanMod 最新版本..."
-    
-    # XanMod 官方 GitHub 不直接提供 deb 包
-    # 但我们可以使用第三方预编译源或者直接从官方 CDN 下载
-    
-    # 检测 CPU 支持的指令集级别
-    local cpu_level="v1"
-    if grep -q "avx512" /proc/cpuinfo 2>/dev/null; then
-        cpu_level="v4"
-    elif grep -q "avx2" /proc/cpuinfo 2>/dev/null; then
-        cpu_level="v3"
-    elif grep -q "avx" /proc/cpuinfo 2>/dev/null; then
-        cpu_level="v2"
-    fi
-    
-    print_info "检测到 CPU 支持级别: x64${cpu_level}"
-    
-    # 使用 jsDelivr CDN 加速 GitHub 下载（如果可用）
-    local jsdelivr_available=0
-    if curl -fsSL --connect-timeout 5 "https://cdn.jsdelivr.net" >/dev/null 2>&1; then
-        jsdelivr_available=1
-        print_info "jsDelivr CDN 可用，将使用加速下载"
-    fi
-    
-    # 尝试从多个源下载
-    local download_urls=(
-        "https://dl.xanmod.org"
-        "https://github.com/xanmod/linux/releases"
-    )
-    
-    # 由于 XanMod 主要通过 APT 源分发，GitHub 上没有直接的 deb 包
-    # 我们改为优化 APT 源的下载速度
-    
-    rm -rf "$tmp_dir"
-    return 1  # 返回失败，回退到 APT 方式
-}
-
 # 直接从 XanMod APT 池下载 deb 包（绕过 APT 索引）
 download_xanmod_direct() {
     local cpu_level
@@ -3480,17 +5097,51 @@ _install_kernel_xanmod_core() {
             local repo_url="http://deb.xanmod.org"
             echo "deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] ${repo_url} releases main" > /etc/apt/sources.list.d/xanmod.list
             
-            # 更新源（带重试）
+            # 更新源（带重试和验证）
+            print_step "更新 APT 源..."
             local retry_count=0
             local max_retries=3
+            local update_success=0
+            
             while [[ $retry_count -lt $max_retries ]]; do
-                if apt-get update 2>&1 | grep -v "^W:"; then
-                    break
+                # 执行 apt-get update 并正确检测返回值
+                if apt-get update -o Dir::Etc::sourcelist="/etc/apt/sources.list.d/xanmod.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" 2>&1; then
+                    # 验证 XanMod 包是否可用
+                    if apt-cache show linux-xanmod-x64v3 >/dev/null 2>&1 || \
+                       apt-cache show linux-xanmod-x64v2 >/dev/null 2>&1 || \
+                       apt-cache show linux-xanmod >/dev/null 2>&1 || \
+                       apt-cache show linux-xanmod-edge >/dev/null 2>&1; then
+                        update_success=1
+                        print_success "XanMod 源更新成功，包已可用"
+                        break
+                    else
+                        print_warn "源已更新但未找到 XanMod 包，尝试完整更新..."
+                        # 尝试完整更新所有源
+                        apt-get update 2>&1 || true
+                        sleep 2
+                    fi
                 fi
                 ((++retry_count))
                 print_warn "更新源失败，重试 ${retry_count}/${max_retries}..."
-                sleep 2
+                sleep 3
             done
+            
+            # 如果仍未成功，进行最后一次完整更新
+            if [[ $update_success -eq 0 ]]; then
+                print_warn "尝试最后一次完整 APT 更新..."
+                apt-get update 2>&1 || true
+                sleep 2
+                # 再次验证
+                if apt-cache show linux-xanmod-x64v3 >/dev/null 2>&1 || \
+                   apt-cache show linux-xanmod >/dev/null 2>&1; then
+                    update_success=1
+                    print_success "XanMod 包已可用"
+                else
+                    print_error "无法获取 XanMod 包列表，请检查网络连接"
+                    print_info "提示：可尝试手动运行 'apt update' 后重试"
+                    return 1
+                fi
+            fi
             
             # 检测 CPU 支持的指令集级别
             local cpu_level="1"
@@ -3524,7 +5175,44 @@ _install_kernel_xanmod_core() {
             # 添加 edge 和 lts 变体
             candidates+=("linux-xanmod-edge" "linux-xanmod-lts")
             
-            # 尝试安装
+            # ========== 安装前环境检查 ==========
+            print_step "检查系统环境..."
+            
+            # 1. 修复可能存在的依赖问题
+            print_info "检查并修复依赖关系..."
+            apt-get install -f -y 2>/dev/null || true
+            
+            # 2. 检查是否有被 hold 的包
+            local held_pkgs
+            held_pkgs=$(dpkg --get-selections | grep -E 'hold$' | awk '{print $1}' || true)
+            if [[ -n "$held_pkgs" ]]; then
+                print_warn "发现被锁定的软件包: ${held_pkgs}"
+                print_info "这可能不影响内核安装，继续..."
+            fi
+            
+            # 3. 检查是否有未完成的 dpkg 配置
+            if [[ -f /var/lib/dpkg/lock-frontend ]]; then
+                # 检查是否有其他 apt 进程
+                if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+                    print_warn "检测到其他包管理进程正在运行，等待..."
+                    local wait_count=0
+                    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && [[ $wait_count -lt 30 ]]; do
+                        sleep 2
+                        ((++wait_count))
+                    done
+                fi
+            fi
+            
+            # 4. 配置未完成的包
+            dpkg --configure -a 2>/dev/null || true
+            
+            # 5. 检查可升级的关键依赖
+            print_info "检查系统依赖更新..."
+            apt-get upgrade -y --with-new-pkgs 2>/dev/null || true
+            
+            print_success "环境检查完成"
+            
+            # ========== 开始安装内核 ==========
             print_step "安装 XanMod 内核..."
             print_info "内核包较大（约 100-200MB），下载可能需要几分钟..."
             local installed=0
@@ -4273,6 +5961,27 @@ main() {
             --debug)
                 DEBUG_MODE=1
                 shift
+                ;;
+            --proxy-tune)
+                # 代理智能调优
+                print_logo
+                detect_os
+                detect_arch
+                detect_virt
+                proxy_tune_wizard
+                exit 0
+                ;;
+            --verify)
+                # 验证优化状态
+                detect_os
+                generate_diagnostic_report
+                exit $?
+                ;;
+            --health)
+                # 仅输出健康评分
+                detect_os
+                quick_verify
+                exit $?
                 ;;
             --help|-h)
                 show_help=1
