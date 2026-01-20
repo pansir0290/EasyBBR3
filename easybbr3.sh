@@ -1588,8 +1588,20 @@ detect_bandwidth() {
     
     local bandwidth=0
     
-    # 方法1: 使用 speedtest-cli (最准确)
-    if command -v speedtest-cli >/dev/null 2>&1; then
+    # 方法1: 优先使用 ethtool 读取网卡速率（最快最准确）
+    local nic
+    nic=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+    if [[ -n "$nic" ]] && command -v ethtool >/dev/null 2>&1; then
+        local nic_speed
+        nic_speed=$(ethtool "$nic" 2>/dev/null | awk -F': ' '/Speed:/{print $2}' | grep -oE '[0-9]+')
+        if [[ -n "$nic_speed" ]] && [[ $nic_speed -gt 0 ]]; then
+            bandwidth=$nic_speed
+            log_info "网卡速率: ${bandwidth} Mbps"
+        fi
+    fi
+    
+    # 方法2: 使用 speedtest-cli (如果网卡检测失败)
+    if [[ $bandwidth -eq 0 ]] && command -v speedtest-cli >/dev/null 2>&1; then
         log_debug "使用 speedtest-cli 检测..."
         local result
         result=$(speedtest-cli --simple 2>/dev/null | grep -i "upload" | awk '{print $2}')
@@ -1599,37 +1611,28 @@ detect_bandwidth() {
         fi
     fi
     
-    # 方法2: 使用 curl 下载测速 (回退)
+    # 方法3: 使用 curl 下载测速 (最后回退，使用更大文件)
     if [[ $bandwidth -eq 0 ]]; then
         log_debug "使用 curl 下载测速..."
-        local start_time end_time duration size_bytes
-        local test_url="https://speed.cloudflare.com/__down?bytes=10000000"
+        local start_time end_time duration
+        local test_url="https://speed.cloudflare.com/__down?bytes=100000000"  # 100MB
         
         start_time=$(date +%s.%N)
-        if curl -so /dev/null --max-time 10 "$test_url" 2>/dev/null; then
+        if curl -so /dev/null --max-time 30 "$test_url" 2>/dev/null; then
             end_time=$(date +%s.%N)
-            duration=$(echo "$end_time - $start_time" | bc 2>/dev/null || echo "10")
+            duration=$(echo "$end_time - $start_time" | bc 2>/dev/null || echo "30")
             if [[ -n "$duration" ]] && (( $(echo "$duration > 0" | bc -l 2>/dev/null || echo 0) )); then
-                bandwidth=$(echo "10 * 8 / $duration" | bc 2>/dev/null || echo "0")
+                bandwidth=$(echo "100 * 8 / $duration" | bc 2>/dev/null || echo "0")
                 bandwidth=${bandwidth:-0}
                 log_info "curl 测速带宽: ${bandwidth} Mbps"
             fi
         fi
     fi
     
-    # 方法3: 使用 ethtool 读取网卡速率 (最后回退)
+    # 默认值
     if [[ $bandwidth -eq 0 ]]; then
-        log_debug "使用 ethtool 读取网卡速率..."
-        local nic
-        nic=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
-        if [[ -n "$nic" ]] && command -v ethtool >/dev/null 2>&1; then
-            bandwidth=$(ethtool "$nic" 2>/dev/null | awk -F': ' '/Speed:/{print $2}' | grep -oE '[0-9]+')
-            bandwidth=${bandwidth:-100}
-            log_warn "使用网卡速率估算: ${bandwidth} Mbps (可能不准确)"
-        else
-            bandwidth=100
-            log_warn "无法检测带宽，使用默认值: 100 Mbps"
-        fi
+        bandwidth=1000
+        log_warn "无法检测带宽，使用默认值: 1000 Mbps"
     fi
     
     SMART_DETECTED_BANDWIDTH=$bandwidth
