@@ -3850,6 +3850,419 @@ line_remove_optimization() {
     print_success "LINE 优化已移除"
 }
 
+#===============================================================================
+# 其他应用优化模块（Google/Apple/Meta/X/Telegram）
+#===============================================================================
+
+# Google 域名列表
+readonly GOOGLE_DOMAINS=(
+    # 核心服务
+    "google.com"
+    "google.com.tw"
+    "google.com.hk"
+    "google.co.jp"
+    "googleapis.com"
+    "gstatic.com"
+    "googleusercontent.com"
+    # YouTube
+    "youtube.com"
+    "youtu.be"
+    "ytimg.com"
+    "yt3.ggpht.com"
+    "googlevideo.com"
+    # Google Play
+    "play.google.com"
+    "play-lh.googleusercontent.com"
+    # Gmail
+    "gmail.com"
+    "mail.google.com"
+    # Drive
+    "drive.google.com"
+    "docs.google.com"
+    # Meet
+    "meet.google.com"
+    # CDN
+    "gvt1.com"
+    "gvt2.com"
+    "gvt3.com"
+    "ggpht.com"
+    "googleadservices.com"
+    "doubleclick.net"
+)
+
+# Apple 域名列表
+readonly APPLE_DOMAINS=(
+    # 核心服务
+    "apple.com"
+    "icloud.com"
+    "icloud-content.com"
+    "apple-cloudkit.com"
+    # App Store
+    "itunes.apple.com"
+    "apps.apple.com"
+    "mzstatic.com"
+    # iMessage/FaceTime
+    "push.apple.com"
+    "courier.push.apple.com"
+    "ess.apple.com"
+    "facetime.apple.com"
+    # iCloud
+    "p01-icloud.com"
+    "p02-icloud.com"
+    "p03-icloud.com"
+    "setup.icloud.com"
+    # CDN
+    "cdn-apple.com"
+    "apple-dns.net"
+    "aaplimg.com"
+    # 软件更新
+    "swcdn.apple.com"
+    "swdist.apple.com"
+    "updates.cdn-apple.com"
+)
+
+# Meta (Facebook/Instagram/WhatsApp) 域名列表
+readonly META_DOMAINS=(
+    # Facebook
+    "facebook.com"
+    "fb.com"
+    "fbcdn.net"
+    "facebook.net"
+    "fb.me"
+    "fbsbx.com"
+    # Instagram
+    "instagram.com"
+    "cdninstagram.com"
+    "ig.me"
+    # WhatsApp
+    "whatsapp.com"
+    "whatsapp.net"
+    "wa.me"
+    "web.whatsapp.com"
+    # Messenger
+    "messenger.com"
+    "m.me"
+    # CDN
+    "fbcdn.com"
+    "xx.fbcdn.net"
+    "scontent.xx.fbcdn.net"
+    "video.xx.fbcdn.net"
+    # API
+    "graph.facebook.com"
+    "api.facebook.com"
+)
+
+# X (Twitter) 域名列表
+readonly X_DOMAINS=(
+    # 核心服务
+    "twitter.com"
+    "x.com"
+    "t.co"
+    "twimg.com"
+    # API
+    "api.twitter.com"
+    "api.x.com"
+    # CDN
+    "pbs.twimg.com"
+    "video.twimg.com"
+    "abs.twimg.com"
+    "ton.twimg.com"
+    # 媒体
+    "media.twitter.com"
+    "upload.twitter.com"
+    # 其他
+    "tweetdeck.com"
+    "periscope.tv"
+    "pscp.tv"
+)
+
+# Telegram 域名列表
+readonly TELEGRAM_DOMAINS=(
+    # 核心服务
+    "telegram.org"
+    "telegram.me"
+    "t.me"
+    "tg.dev"
+    # API
+    "api.telegram.org"
+    "core.telegram.org"
+    # CDN/媒体
+    "cdn1.telegram-cdn.org"
+    "cdn2.telegram-cdn.org"
+    "cdn3.telegram-cdn.org"
+    "cdn4.telegram-cdn.org"
+    "cdn5.telegram-cdn.org"
+    "telegram-cdn.org"
+    # Web
+    "web.telegram.org"
+    "webk.telegram.org"
+    "webz.telegram.org"
+    # 更新
+    "updates.telegram.org"
+    # DC 服务器
+    "venus.web.telegram.org"
+    "pluto.web.telegram.org"
+    "flora.web.telegram.org"
+)
+
+# 应用优化配置文件路径
+readonly APP_IP_DIR="/etc/bbr3-apps"
+readonly APP_SYSCTL_FILE="/etc/sysctl.d/99-bbr-apps.conf"
+
+# 通用应用 DNS 预解析
+app_dns_prefetch() {
+    local app_name="$1"
+    shift
+    local domains=("$@")
+    
+    log_info "执行 ${app_name} DNS 预解析..."
+    
+    # 确保目录存在
+    mkdir -p "$APP_IP_DIR"
+    
+    local ip_file="${APP_IP_DIR}/${app_name,,}-ips.conf"
+    local resolved_ips=""
+    
+    for domain in "${domains[@]}"; do
+        local ips
+        ips=$(dig +short "$domain" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -5)
+        if [[ -n "$ips" ]]; then
+            resolved_ips+="$ips"$'\n'
+        fi
+    done
+    
+    if [[ -n "$resolved_ips" ]]; then
+        echo "$resolved_ips" | sort -u > "$ip_file"
+        local count
+        count=$(wc -l < "$ip_file")
+        print_success "${app_name} DNS 预解析完成，获取 $count 个 IP"
+    else
+        print_warn "${app_name} DNS 预解析失败"
+    fi
+}
+
+# 通用应用 QoS 设置
+app_qos_setup() {
+    local app_name="$1"
+    local dscp_value="${2:-46}"  # 默认 EF
+    
+    local ip_file="${APP_IP_DIR}/${app_name,,}-ips.conf"
+    
+    if [[ ! -f "$ip_file" ]]; then
+        print_warn "无 ${app_name} IP 列表，跳过 QoS 设置"
+        return
+    fi
+    
+    if ! command -v iptables >/dev/null 2>&1; then
+        print_warn "iptables 未安装，跳过 QoS 设置"
+        return
+    fi
+    
+    local chain_name="${app_name^^}_QOS"
+    
+    # 创建专用链
+    iptables -t mangle -N "$chain_name" 2>/dev/null || iptables -t mangle -F "$chain_name"
+    
+    # 为 IP 设置 DSCP 标记
+    while read -r ip; do
+        [[ -z "$ip" ]] && continue
+        iptables -t mangle -A "$chain_name" -d "$ip" -j DSCP --set-dscp "$dscp_value" 2>/dev/null
+        iptables -t mangle -A "$chain_name" -s "$ip" -j DSCP --set-dscp "$dscp_value" 2>/dev/null
+    done < "$ip_file"
+    
+    # 添加到 POSTROUTING
+    iptables -t mangle -C POSTROUTING -j "$chain_name" 2>/dev/null || \
+        iptables -t mangle -A POSTROUTING -j "$chain_name"
+    
+    print_success "${app_name} QoS 已配置（DSCP=$dscp_value）"
+}
+
+# 应用优化主菜单
+app_optimization_menu() {
+    while true; do
+        clear
+        print_header "应用专项优化"
+        
+        echo -e "${DIM}为特定应用优化网络，提升访问速度和稳定性${NC}"
+        echo
+        
+        # 显示当前状态
+        echo -e "  ${BOLD}已优化应用:${NC}"
+        local optimized_count=0
+        for app in LINE Google Apple Meta X Telegram; do
+            local ip_file="${APP_IP_DIR}/${app,,}-ips.conf"
+            [[ "$app" == "LINE" ]] && ip_file="$LINE_IP_FILE"
+            if [[ -f "$ip_file" ]]; then
+                local count=$(wc -l < "$ip_file" 2>/dev/null || echo 0)
+                echo -e "    ${GREEN}✓${NC} ${app} (${count} IPs)"
+                ((optimized_count++))
+            fi
+        done
+        [[ $optimized_count -eq 0 ]] && echo -e "    ${YELLOW}无${NC}"
+        echo
+        
+        print_separator
+        echo
+        echo -e "  ${GREEN}${BOLD}1)${NC} ${GREEN}📱 LINE${NC}      - 通话/消息/文件优化"
+        echo -e "  ${CYAN}2)${NC} 🔍 Google    - YouTube/Gmail/Drive 优化"
+        echo -e "  ${CYAN}3)${NC} 🍎 Apple     - iCloud/FaceTime/App Store 优化"
+        echo -e "  ${CYAN}4)${NC} 📘 Meta      - Facebook/Instagram/WhatsApp 优化"
+        echo -e "  ${CYAN}5)${NC} 🐦 X         - Twitter/X 优化"
+        echo -e "  ${CYAN}6)${NC} ✈️  Telegram  - 电报优化"
+        echo
+        echo -e "  ${GREEN}${BOLD}7)${NC} ${GREEN}🚀 一键全部优化${NC}"
+        echo -e "  ${CYAN}8)${NC} ❌ 移除所有应用优化"
+        echo
+        echo -e "  ${CYAN}0)${NC} 返回上级菜单"
+        echo
+        
+        read_choice "请选择" 8
+        
+        case "$MENU_CHOICE" in
+            0) return ;;
+            1) line_optimization_menu ;;
+            2) optimize_single_app "Google" "${GOOGLE_DOMAINS[@]}" ;;
+            3) optimize_single_app "Apple" "${APPLE_DOMAINS[@]}" ;;
+            4) optimize_single_app "Meta" "${META_DOMAINS[@]}" ;;
+            5) optimize_single_app "X" "${X_DOMAINS[@]}" ;;
+            6) optimize_single_app "Telegram" "${TELEGRAM_DOMAINS[@]}" ;;
+            7) optimize_all_apps ;;
+            8) remove_all_app_optimizations ;;
+        esac
+        
+        [[ "$MENU_CHOICE" != "1" ]] && [[ "$MENU_CHOICE" != "0" ]] && {
+            echo
+            read -rp "按 Enter 键继续..."
+        }
+    done
+}
+
+# 优化单个应用
+optimize_single_app() {
+    local app_name="$1"
+    shift
+    local domains=("$@")
+    
+    print_header "${app_name} 优化"
+    
+    echo -e "${CYAN}将为 ${app_name} 执行以下优化:${NC}"
+    echo "  1. DNS 预解析获取 IP 列表"
+    echo "  2. 设置 QoS 流量优先级"
+    echo
+    
+    if ! confirm "确认优化 ${app_name}？" "y"; then
+        return
+    fi
+    
+    echo
+    print_step "[1/2] DNS 预解析..."
+    app_dns_prefetch "$app_name" "${domains[@]}"
+    
+    print_step "[2/2] QoS 设置..."
+    app_qos_setup "$app_name"
+    
+    echo
+    print_success "${app_name} 优化完成！"
+}
+
+# 一键优化所有应用
+optimize_all_apps() {
+    print_header "一键全部优化"
+    
+    echo -e "${CYAN}将优化以下应用:${NC}"
+    echo "  - LINE (通话/消息/文件)"
+    echo "  - Google (YouTube/Gmail/Drive)"
+    echo "  - Apple (iCloud/FaceTime)"
+    echo "  - Meta (Facebook/Instagram/WhatsApp)"
+    echo "  - X (Twitter)"
+    echo "  - Telegram (电报)"
+    echo
+    
+    if ! confirm "确认一键优化所有应用？" "y"; then
+        return
+    fi
+    
+    echo
+    
+    # LINE 特殊处理（有完整的优化流程）
+    print_step "[1/6] 优化 LINE..."
+    line_apply_sysctl
+    line_dns_prefetch
+    line_qos_setup
+    
+    print_step "[2/6] 优化 Google..."
+    app_dns_prefetch "Google" "${GOOGLE_DOMAINS[@]}"
+    app_qos_setup "Google"
+    
+    print_step "[3/6] 优化 Apple..."
+    app_dns_prefetch "Apple" "${APPLE_DOMAINS[@]}"
+    app_qos_setup "Apple"
+    
+    print_step "[4/6] 优化 Meta..."
+    app_dns_prefetch "Meta" "${META_DOMAINS[@]}"
+    app_qos_setup "Meta"
+    
+    print_step "[5/6] 优化 X..."
+    app_dns_prefetch "X" "${X_DOMAINS[@]}"
+    app_qos_setup "X"
+    
+    print_step "[6/6] 优化 Telegram..."
+    app_dns_prefetch "Telegram" "${TELEGRAM_DOMAINS[@]}"
+    app_qos_setup "Telegram"
+    
+    echo
+    echo -e "${GREEN}${BOLD}${ICON_OK} 所有应用优化完成！${NC}"
+    echo
+    echo -e "  ${BOLD}优化摘要:${NC}"
+    echo "    - IP 列表目录: ${APP_IP_DIR}"
+    echo "    - QoS: 所有应用流量标记为 DSCP=EF"
+    echo
+    echo -e "  ${DIM}提示: 应用优化与代理模式可同时使用${NC}"
+}
+
+# 移除所有应用优化
+remove_all_app_optimizations() {
+    print_header "移除所有应用优化"
+    
+    if ! confirm "确认移除所有应用优化？" "n"; then
+        return
+    fi
+    
+    echo
+    
+    # 移除 LINE 优化
+    print_step "移除 LINE 优化..."
+    rm -f "$LINE_SYSCTL_FILE"
+    rm -f "$LINE_IP_FILE"
+    systemctl stop bbr3-line-warmup.timer 2>/dev/null
+    systemctl disable bbr3-line-warmup.timer 2>/dev/null
+    rm -f /etc/systemd/system/bbr3-line-warmup.service
+    rm -f /etc/systemd/system/bbr3-line-warmup.timer
+    rm -f /usr/local/bin/bbr3-line-warmup
+    iptables -t mangle -D POSTROUTING -j LINE_QOS 2>/dev/null
+    iptables -t mangle -F LINE_QOS 2>/dev/null
+    iptables -t mangle -X LINE_QOS 2>/dev/null
+    
+    # 移除其他应用优化
+    for app in Google Apple Meta X Telegram; do
+        print_step "移除 ${app} 优化..."
+        local chain_name="${app^^}_QOS"
+        iptables -t mangle -D POSTROUTING -j "$chain_name" 2>/dev/null
+        iptables -t mangle -F "$chain_name" 2>/dev/null
+        iptables -t mangle -X "$chain_name" 2>/dev/null
+    done
+    
+    # 移除 IP 列表目录
+    rm -rf "$APP_IP_DIR"
+    
+    # 重新加载 sysctl
+    systemctl daemon-reload 2>/dev/null
+    sysctl --system >/dev/null 2>&1
+    
+    echo
+    print_success "所有应用优化已移除"
+}
+
 # 安装系统服务
 install_system_services() {
     local services_to_install=("$@")
@@ -5156,7 +5569,7 @@ scene_config_menu() {
         echo
         print_separator
         echo -e "  ${DIM}应用专项优化:${NC}"
-        echo -e "  ${GREEN}12)${NC} ${GREEN}📱 LINE优化${NC}  - 专为LINE优化，通话/文件/消息加速"
+        echo -e "  ${GREEN}12)${NC} ${GREEN}📱 应用优化${NC}  - LINE/Google/Apple/Meta/X/Telegram"
         echo
         echo -e "  ${CYAN}0)${NC} 返回主菜单"
         echo
@@ -5177,7 +5590,7 @@ scene_config_menu() {
             9) selected_mode="concurrent" ;;
             10) selected_mode="speed" ;;
             11) selected_mode="performance" ;;
-            12) line_optimization_menu; continue ;;
+            12) app_optimization_menu; continue ;;
             *) continue ;;
         esac
         
