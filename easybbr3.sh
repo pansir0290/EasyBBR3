@@ -124,6 +124,8 @@ PRECHECK_DISK=0
 PRECHECK_DEPS=0
 PRECHECK_UPDATE=0
 declare -a PRECHECK_MESSAGES=()
+APT_UPDATE_DONE=0
+NETWORK_REGION_DETECTED=0
 
 #===============================================================================
 # 全局变量 - 配置
@@ -138,6 +140,7 @@ NON_INTERACTIVE=0
 DEBUG_MODE=0
 PIPE_MODE=0
 MENU_CHOICE=""
+APPLY_GUIDANCE_SHOWN=0
 
 #===============================================================================
 # 全局变量 - 缓冲区调优
@@ -820,15 +823,47 @@ precheck_network() {
     
     local targets=("8.8.8.8" "114.114.114.114" "1.1.1.1")
     local connected=0
+    local ping_available=0
     
-    for target in "${targets[@]}"; do
-        if ping -c 1 -W 3 "$target" >/dev/null 2>&1; then
-            connected=1
-            break
-        fi
-    done
+    if command -v ping >/dev/null 2>&1; then
+        ping_available=1
+    else
+        PRECHECK_MESSAGES+=("未检测到 ping 命令，将使用备用方式检测网络")
+    fi
+    
+    if [[ $ping_available -eq 1 ]]; then
+        for target in "${targets[@]}"; do
+            if ping -c 1 -W 3 "$target" >/dev/null 2>&1; then
+                connected=1
+                break
+            fi
+        done
+    fi
     
     if [[ $connected -eq 0 ]]; then
+        local http_ok=0
+        local http_targets=("https://www.baidu.com" "https://www.cloudflare.com" "https://www.google.com/generate_204")
+        
+        for url in "${http_targets[@]}"; do
+            if command -v curl >/dev/null 2>&1; then
+                if curl -fsSL --connect-timeout 3 --max-time 5 -o /dev/null "$url"; then
+                    http_ok=1
+                    break
+                fi
+            elif command -v wget >/dev/null 2>&1; then
+                if wget -q --spider --timeout=5 --tries=1 "$url"; then
+                    http_ok=1
+                    break
+                fi
+            fi
+        done
+        
+        if [[ $http_ok -eq 1 ]]; then
+            PRECHECK_NETWORK=1
+            PRECHECK_MESSAGES+=("ICMP 可能被屏蔽，已通过 HTTP 备用检测确认网络可用")
+            return 0
+        fi
+        
         PRECHECK_NETWORK=2
         PRECHECK_MESSAGES+=("网络连接失败，请检查网络配置")
         return 1
@@ -844,17 +879,63 @@ precheck_dns() {
     
     local domains=("google.com" "baidu.com" "github.com")
     local resolved=0
+    local tools_checked=0
     
     for domain in "${domains[@]}"; do
-        if host "$domain" >/dev/null 2>&1 || nslookup "$domain" >/dev/null 2>&1 || ping -c 1 -W 3 "$domain" >/dev/null 2>&1; then
-            resolved=1
-            break
+        if command -v host >/dev/null 2>&1; then
+            tools_checked=1
+            if host "$domain" >/dev/null 2>&1; then
+                resolved=1
+                break
+            fi
+        fi
+        
+        if command -v nslookup >/dev/null 2>&1; then
+            tools_checked=1
+            if nslookup "$domain" >/dev/null 2>&1; then
+                resolved=1
+                break
+            fi
+        fi
+        
+        if command -v getent >/dev/null 2>&1; then
+            tools_checked=1
+            if getent hosts "$domain" >/dev/null 2>&1; then
+                resolved=1
+                break
+            fi
+        fi
+        
+        if command -v ping >/dev/null 2>&1; then
+            tools_checked=1
+            if ping -c 1 -W 3 "$domain" >/dev/null 2>&1; then
+                resolved=1
+                break
+            fi
+        fi
+        
+        if command -v curl >/dev/null 2>&1; then
+            tools_checked=1
+            if curl -fsSL --connect-timeout 3 --max-time 5 -o /dev/null "https://${domain}"; then
+                resolved=1
+                break
+            fi
+        elif command -v wget >/dev/null 2>&1; then
+            tools_checked=1
+            if wget -q --spider --timeout=5 --tries=1 "https://${domain}"; then
+                resolved=1
+                break
+            fi
         fi
     done
     
     if [[ $resolved -eq 0 ]]; then
         PRECHECK_DNS=1
-        PRECHECK_MESSAGES+=("DNS 解析可能存在问题，建议检查 /etc/resolv.conf")
+        if [[ $tools_checked -eq 0 ]]; then
+            PRECHECK_MESSAGES+=("DNS 检测工具缺失，建议安装 dnsutils/bind-utils 或检查系统环境")
+        else
+            PRECHECK_MESSAGES+=("DNS 解析可能存在问题，建议检查 /etc/resolv.conf")
+        fi
         return 1
     fi
     
@@ -891,12 +972,42 @@ precheck_disk() {
     return 0
 }
 
+# 更新 APT 缓存（带缓存）
+apt_update_cached() {
+    local force="${1:-0}"
+    
+    if [[ "$PKG_MANAGER" != "apt" ]]; then
+        return 0
+    fi
+    
+    if [[ $force -eq 0 && $APT_UPDATE_DONE -eq 1 ]]; then
+        log_debug "APT 缓存已更新，跳过"
+        return 0
+    fi
+    
+    if apt-get update -qq; then
+        APT_UPDATE_DONE=1
+        return 0
+    fi
+    
+    return 1
+}
+
 # 检测并安装依赖
 precheck_deps() {
     log_debug "检查必要依赖..."
     
     local missing_deps=()
-    local dep cmd
+    local dep
+    
+    add_missing_dep() {
+        local name="$1"
+        local existing
+        for existing in "${missing_deps[@]}"; do
+            [[ "$existing" == "$name" ]] && return
+        done
+        missing_deps+=("$name")
+    }
     
     for dep in $REQUIRED_DEPS; do
         # 映射包名到检测方式
@@ -914,13 +1025,39 @@ precheck_deps() {
         esac
     done
     
+    local dns_tool_ok=0
+    for tool in host nslookup getent; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            dns_tool_ok=1
+            break
+        fi
+    done
+    
+    if [[ $dns_tool_ok -eq 0 ]]; then
+        case "$PKG_MANAGER" in
+            apt) add_missing_dep "dnsutils" ;;
+            dnf|yum) add_missing_dep "bind-utils" ;;
+        esac
+    fi
+    
+    if ! command -v ping >/dev/null 2>&1; then
+        case "$PKG_MANAGER" in
+            apt) add_missing_dep "iputils-ping" ;;
+            dnf|yum) add_missing_dep "iputils" ;;
+        esac
+    fi
+    
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
         log_info "缺少依赖: ${missing_deps[*]}"
         print_info "正在安装缺少的依赖: ${missing_deps[*]}"
         
         case "$PKG_MANAGER" in
             apt)
-                apt-get update -qq
+                if ! apt_update_cached; then
+                    PRECHECK_DEPS=2
+                    PRECHECK_MESSAGES+=("软件包缓存更新失败，请检查网络或源配置")
+                    return 1
+                fi
                 apt-get install -y -qq "${missing_deps[@]}" || {
                     PRECHECK_DEPS=2
                     PRECHECK_MESSAGES+=("依赖安装失败: ${missing_deps[*]}")
@@ -989,13 +1126,12 @@ check_package_source() {
     case "$PKG_MANAGER" in
         apt)
             # 尝试更新 APT 缓存
-            if ! apt-get update -qq 2>&1 | grep -qE '(Failed|Error|错误)'; then
+            local apt_output
+            apt_output=$(apt-get update -qq 2>&1)
+            if ! echo "$apt_output" | grep -qE '(Failed|Error|错误)'; then
+                APT_UPDATE_DONE=1
                 return 0
             fi
-            
-            # 检测具体错误
-            local apt_output
-            apt_output=$(apt-get update 2>&1)
             
             if echo "$apt_output" | grep -qE 'Could not resolve|无法解析'; then
                 log_warn "APT 源 DNS 解析失败"
@@ -1071,11 +1207,14 @@ EOF
     fi
     
     # 重新更新
-    if apt-get update -qq 2>&1 | grep -qE '(Failed|Error)'; then
+    local apt_output
+    apt_output=$(apt-get update -qq 2>&1)
+    if echo "$apt_output" | grep -qE '(Failed|Error)'; then
         log_warn "修复后仍有问题，恢复原配置"
         [[ -f "$backup_file" ]] && cp "$backup_file" /etc/apt/sources.list
         return 1
     fi
+    APT_UPDATE_DONE=1
     
     print_success "APT 源修复成功"
     return 0
@@ -1084,6 +1223,10 @@ EOF
 # 检测网络环境（国内/国外）
 detect_network_region() {
     log_debug "检测网络环境..."
+    
+    if [[ $NETWORK_REGION_DETECTED -eq 1 ]]; then
+        return 0
+    fi
     
     # 测试国内外服务器延迟
     local cn_latency=9999
@@ -1115,6 +1258,8 @@ detect_network_region() {
         MIRROR_REGION="intl"
         log_info "检测到国际网络环境，将使用官方源"
     fi
+    
+    NETWORK_REGION_DETECTED=1
 }
 
 # 检测当前 APT 源是否为国内镜像（返回 0 表示官方源，返回 1 表示国内镜像）
@@ -1193,7 +1338,11 @@ run_precheck() {
     # 网络检查
     echo -n "  检查网络连通性..."
     if precheck_network; then
-        echo -e " [${GREEN}${ICON_OK}${NC}]"
+        if [[ $PRECHECK_NETWORK -eq 1 ]]; then
+            echo -e " [${YELLOW}${ICON_WARN}${NC}]"
+        else
+            echo -e " [${GREEN}${ICON_OK}${NC}]"
+        fi
     else
         echo -e " [${RED}${ICON_FAIL}${NC}]"
         all_passed=0
@@ -5064,13 +5213,13 @@ EOF
     
     # 更新源缓存
     print_step "更新软件包缓存..."
-    if apt-get update -qq; then
+    if apt_update_cached 1; then
         print_success "软件包缓存更新成功"
         return 0
     else
         print_error "软件包缓存更新失败，正在恢复原源配置..."
         cp "$backup_file" "$sources_file"
-        apt-get update -qq || true
+        apt_update_cached 1 || true
         return 1
     fi
 }
@@ -5119,13 +5268,13 @@ EOF
     
     # 更新源缓存
     print_step "更新软件包缓存..."
-    if apt-get update -qq; then
+    if apt_update_cached 1; then
         print_success "软件包缓存更新成功"
         return 0
     else
         print_error "软件包缓存更新失败，正在恢复原源配置..."
         cp "$backup_file" "$sources_file"
-        apt-get update -qq || true
+        apt_update_cached 1 || true
         return 1
     fi
 }
@@ -5233,6 +5382,7 @@ kernel_precheck() {
 # 全局变量：记录安装前的内核列表
 KERNEL_LIST_BEFORE=""
 INSTALLED_KERNEL_PKG=""
+INSTALLED_KERNEL_VERSION=""
 
 # 记录安装前的内核列表
 record_kernel_list_before() {
@@ -5303,6 +5453,7 @@ verify_kernel_installation() {
                     kernel_file="/boot/vmlinuz-${version}"
                     kernel_version="$version"
                     INSTALLED_KERNEL_PKG="$pkg"
+                    INSTALLED_KERNEL_VERSION="$kernel_version"
                     break
                 fi
             done
@@ -5315,6 +5466,7 @@ verify_kernel_installation() {
                     kernel_file="/boot/vmlinuz-${version}"
                     kernel_version="$version"
                     INSTALLED_KERNEL_PKG="$pkg"
+                    INSTALLED_KERNEL_VERSION="$kernel_version"
                     break
                 fi
             done
@@ -5653,6 +5805,37 @@ safe_kernel_install() {
     fi
     
     print_success "${kernel_type} 内核安装并验证成功"
+    print_kernel_post_install_summary "$kernel_type"
+    return 0
+}
+
+# 内核安装后提示摘要与下一步
+print_kernel_post_install_summary() {
+    local kernel_type="$1"
+    local verify_hint
+
+    if [[ $APPLY_GUIDANCE_SHOWN -eq 1 ]]; then
+        return 0
+    fi
+
+    if [[ -x /usr/local/bin/bbr3 ]]; then
+        verify_hint="bbr3 --verify / bbr3 --status"
+    else
+        verify_hint="sudo ${SCRIPT_NAME} --verify / --status"
+    fi
+
+    echo
+    print_separator
+    echo -e "  ${GREEN}${ICON_OK}${NC} ${kernel_type} 内核安装完成"
+    print_separator
+    print_kv "新内核包" "${INSTALLED_KERNEL_PKG:-未知}"
+    [[ -n "${INSTALLED_KERNEL_VERSION}" ]] && print_kv "新内核版本" "${INSTALLED_KERNEL_VERSION}"
+    print_kv "下一步" "重启系统后生效"
+    print_kv "验证命令" "$verify_hint"
+    print_kv "回滚提示" "如启动异常，请在 GRUB 中选择旧内核"
+    print_separator
+
+    APPLY_GUIDANCE_SHOWN=1
     return 0
 }
 
@@ -5856,7 +6039,9 @@ _install_kernel_xanmod_core() {
             select_xanmod_download_method || return 1
             
             # 安装依赖
-            apt-get update -qq
+            if ! apt_update_cached; then
+                print_warn "软件包缓存更新失败，尝试继续安装依赖"
+            fi
             apt-get install -y -qq curl gnupg
             
             # 如果选择直接下载方式
@@ -6011,7 +6196,11 @@ _install_kernel_xanmod_core() {
             
             # 5. 检查可升级的关键依赖
             print_info "检查系统依赖更新..."
-            apt-get upgrade -y --with-new-pkgs 2>/dev/null || true
+            if confirm "是否执行系统升级（apt-get upgrade）？可能升级大量包" "n"; then
+                apt-get upgrade -y --with-new-pkgs 2>/dev/null || true
+            else
+                print_warn "已跳过系统升级（如需可手动执行 apt-get upgrade）"
+            fi
             
             print_success "环境检查完成"
             
@@ -6062,7 +6251,6 @@ install_kernel_xanmod() {
     
     # 使用安全安装包装函数
     if safe_kernel_install "XanMod" _install_kernel_xanmod_core; then
-        print_warn "请重启系统以使用新内核"
         return 0
     else
         return 1
@@ -6074,10 +6262,14 @@ _install_kernel_liquorix_core() {
     case "$DIST_ID" in
         ubuntu)
             print_step "添加 Liquorix PPA..."
-            apt-get update -qq
+            if ! apt_update_cached; then
+                print_warn "软件包缓存更新失败，尝试继续安装"
+            fi
             apt-get install -y -qq software-properties-common
             add-apt-repository -y ppa:damentz/liquorix
-            apt-get update -qq
+            if ! apt_update_cached 1; then
+                print_warn "软件包缓存更新失败，可能影响 Liquorix 安装"
+            fi
             
             print_step "安装 Liquorix 内核..."
             apt-get install -y linux-image-liquorix-amd64 linux-headers-liquorix-amd64
@@ -6103,7 +6295,6 @@ install_kernel_liquorix() {
     
     # 使用安全安装包装函数
     if safe_kernel_install "Liquorix" _install_kernel_liquorix_core; then
-        print_warn "请重启系统以使用新内核"
         return 0
     else
         return 1
@@ -6156,7 +6347,6 @@ install_kernel_elrepo() {
     
     # 使用安全安装包装函数
     if safe_kernel_install "ELRepo" _install_kernel_elrepo_core; then
-        print_warn "请重启系统以使用新内核"
         return 0
     else
         return 1
@@ -6166,7 +6356,9 @@ install_kernel_elrepo() {
 # HWE 内核安装核心逻辑（内部函数）
 _install_kernel_hwe_core() {
     print_step "更新软件包列表..."
-    apt-get update -qq
+    if ! apt_update_cached; then
+        print_warn "软件包缓存更新失败，尝试继续安装"
+    fi
     
     print_step "安装 HWE 内核..."
     
@@ -6202,7 +6394,6 @@ install_kernel_hwe() {
     
     # 使用安全安装包装函数
     if safe_kernel_install "HWE" _install_kernel_hwe_core; then
-        print_warn "请重启系统以使用新内核"
         return 0
     else
         return 1
