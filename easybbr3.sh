@@ -3352,17 +3352,29 @@ EOF
 # LINE 应用优化模块
 #===============================================================================
 
-# LINE 域名列表
+# LINE 域名列表（包含文件服务器）
 readonly LINE_DOMAINS=(
+    # 主域名
     "line.me"
     "line-scdn.net"
     "line-apps.com"
     "naver.jp"
     "line.naver.jp"
+    # 文件/媒体服务器（关键！）
     "obs.line-scdn.net"
+    "obs-tw.line-scdn.net"
+    "obs-jp.line-scdn.net"
     "stf.line-scdn.net"
     "w.line-scdn.net"
     "profile.line-scdn.net"
+    # 下载服务器
+    "dl.stickershop.line.naver.jp"
+    "scdn.line-apps.com"
+    # API 和长连接
+    "gw.line.naver.jp"
+    "legy.line.naver.jp"
+    "legy-jp.line.naver.jp"
+    "legy-tw.line.naver.jp"
 )
 
 # LINE 配置文件路径
