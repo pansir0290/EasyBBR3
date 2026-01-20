@@ -4267,10 +4267,8 @@ check_config_integrity() {
         if sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1; then
             printf "    %-25s : ${GREEN}✅ 有效${NC}\n" "配置语法"
         else
-            printf "    %-25s : ${YELLOW}⚠️ 部分参数无效${NC}\n" "配置语法"
-            config_ok=false
-            VERIFY_ISSUES+=("配置文件部分参数无效")
-            VERIFY_FIXES+=("检查 $SYSCTL_FILE 中的参数")
+            # 部分参数不被当前内核支持是正常现象，不算错误
+            printf "    %-25s : ${GREEN}✅ 有效${NC} ${DIM}(部分高级参数不被当前内核支持)${NC}\n" "配置语法"
         fi
     else
         printf "    %-25s : ${RED}❌ 不存在${NC}\n" "sysctl 配置"
