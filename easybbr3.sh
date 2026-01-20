@@ -3300,6 +3300,14 @@ net.core.netdev_budget_usecs = 8000
 net.ipv4.neigh.default.gc_thresh1 = 1024
 net.ipv4.neigh.default.gc_thresh2 = 4096
 net.ipv4.neigh.default.gc_thresh3 = 8192
+
+# TCP Keepalive 优化（保持连接活跃）
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 6
+
+# 路由缓存优化
+net.ipv4.route.max_size = 2147483647
 EOF
 }
 
