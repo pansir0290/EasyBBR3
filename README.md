@@ -5,7 +5,7 @@
 [![GitHub](https://img.shields.io/badge/GitHub-xx2468171796-blue?logo=github)](https://github.com/xx2468171796)
 [![Telegram](https://img.shields.io/badge/Telegram-加入群组-blue?logo=telegram)](https://t.me/+RZMe7fnvvUg1OWJl)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-2.0.1-orange.svg)](https://github.com/xx2468171796/EasyBBR3)
+[![Version](https://img.shields.io/badge/Version-2.1.0-orange.svg)](https://github.com/xx2468171796/EasyBBR3)
 [![Stars](https://img.shields.io/github/stars/xx2468171796/EasyBBR3?style=social)](https://github.com/xx2468171796/EasyBBR3)
 
 **一键安装 BBR/BBR2/BBR3 TCP 拥塞控制算法，支持多种场景优化模式**
@@ -28,12 +28,14 @@
 
 ## ✨ 功能特点
 
-- 🎯 **智能检测** - 自动检测系统环境、内核版本、最佳算法
+- 🎯 **智能检测** - 自动检测系统环境、内核版本、带宽/RTT、最佳算法
 - 🔧 **场景优化** - 7种预设场景模式（代理/视频/游戏/并发等）
 - 📦 **内核安装** - 支持 XanMod/Liquorix/ELRepo/HWE 内核一键安装
 - 🛡️ **安全机制** - 内核安装验证、自动回滚、配置备份恢复
 - 🌏 **国内优化** - 自动检测网络环境，智能切换镜像源
 - 💻 **多系统支持** - Debian/Ubuntu/CentOS/RHEL/Rocky/AlmaLinux
+- ⏰ **时间自动优化** - 晚高峰自动切换激进模式（19:00-23:00）
+- 🔄 **一键更新** - 从 GitHub 自动下载最新版本
 
 ## 📋 支持的系统
 
@@ -79,16 +81,16 @@ bbr3
 运行脚本后会显示交互式菜单：
 
 ```
-1) 查看当前状态
-2) 启用 BBR (推荐)
-3) 启用 BBR2
-4) 启用 BBR3
-5) 场景配置 (按用途优化，推荐VPS代理使用)
-6) 自动优化配置 (按网络环境自动调参)
-7) 安装新内核
-8) 备份/恢复配置
-9) 卸载配置
-10) 安装快捷命令 bbr3
+1) 代理智能调优 (推荐翻墙用户！含一键自动优化) ⭐
+2) 安装新内核 (获取BBR3支持)
+3) 验证优化状态 (检测优化是否生效)
+4) 查看当前状态
+5) 备份/恢复配置
+6) 时间自动优化 (晚高峰自动切换激进模式)
+7) 卸载配置
+8) 安装快捷命令 bbr3
+9) 更新脚本 (从 GitHub 获取最新版本)
+10) PVE Tools 一键脚本
 0) 返回/退出
 ```
 
@@ -161,6 +163,26 @@ sudo bbr3 --help
 - ✅ 快速重连：禁用慢启动，断线重连更快
 - ✅ TFO 加速：TCP Fast Open 减少握手延迟
 - ✅ 低配优化：针对小内存 VPS 的激进优化模式
+- ✅ 连接保活：TCP Keepalive 60秒探测，保持连接活跃
+- ✅ 高并发：conntrack/SYN队列/端口范围优化
+- ✅ 路由缓存：扩大路由表容量，加速连接建立
+
+### ⏰ 时间自动优化
+
+晚高峰自动切换激进模式，提升翻墙体验：
+
+```bash
+# 在主菜单选择「时间自动优化」启用
+```
+
+时段设置：
+- **晚高峰 (19:00-23:00)**：128MB 缓冲区、131072 队列（翻倍）
+- **非高峰**：64MB 缓冲区、65535 队列（标准）
+
+工作原理：
+- Cron 定时任务每小时检查
+- 自动切换配置，无需手动干预
+- 不影响其他优化参数（Keepalive/conntrack 等）
 
 ### ✅ 优化验证系统
 
