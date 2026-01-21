@@ -5739,11 +5739,12 @@ scene_config_menu() {
         echo -e "  ${DIM}应用专项优化:${NC}"
         echo -e "  ${GREEN}12)${NC} ${GREEN}📱 应用优化${NC}  - LINE/Google/Apple/Meta/X/Telegram"
         echo -e "  ${YELLOW}13)${NC} ${YELLOW}🛡️  抗丢包${NC}   - 中转机/高丢包环境专用"
+        echo -e "  ${PURPLE}14)${NC} ${PURPLE}📊 队列切换${NC} - fq/fq_codel/fq_pie/cake"
         echo
         echo -e "  ${CYAN}0)${NC} 返回主菜单"
         echo
         
-        read_choice "请选择场景模式" 13
+        read_choice "请选择场景模式" 14
         
         local selected_mode=""
         case "$MENU_CHOICE" in
@@ -5761,6 +5762,7 @@ scene_config_menu() {
             11) selected_mode="performance" ;;
             12) app_optimization_menu; continue ;;
             13) apply_anti_loss_optimization; continue ;;
+            14) qdisc_switch_menu; continue ;;
             *) continue ;;
         esac
         
@@ -6219,6 +6221,366 @@ apply_qdisc_runtime() {
     log_debug "应用 qdisc ${qdisc} 到 ${dev}"
     
     tc qdisc replace dev "$dev" root "$qdisc" 2>/dev/null || true
+}
+
+#===============================================================================
+# 队列调度（Qdisc）切换模块
+#===============================================================================
+
+# 获取 qdisc 描述
+get_qdisc_description() {
+    local qdisc="$1"
+    case "$qdisc" in
+        fq)
+            echo "Fair Queue - BBR 最佳搭配，精确 pacing，高吞吐量"
+            ;;
+        fq_codel)
+            echo "Fair Queue + CoDel - 低延迟，抗 Bufferbloat，适合通用场景"
+            ;;
+        fq_pie)
+            echo "Fair Queue + PIE - 新一代 AQM，低延迟+高吞吐平衡"
+            ;;
+        cake)
+            echo "CAKE - 最先进的 AQM，自动带宽整形，适合复杂网络"
+            ;;
+        pfifo_fast)
+            echo "默认队列 - 简单 FIFO，无 AQM，不推荐"
+            ;;
+        *)
+            echo "未知队列规则"
+            ;;
+    esac
+}
+
+# 获取 qdisc 推荐场景
+get_qdisc_recommendation() {
+    local qdisc="$1"
+    case "$qdisc" in
+        fq)
+            echo "代理/VPN、大文件传输、BBR 用户"
+            ;;
+        fq_codel)
+            echo "游戏、视频通话、通用场景"
+            ;;
+        fq_pie)
+            echo "高负载服务器、需要低延迟+高吞吐"
+            ;;
+        cake)
+            echo "家庭网关、复杂网络、需要带宽整形"
+            ;;
+        *)
+            echo "不推荐"
+            ;;
+    esac
+}
+
+# 获取当前 qdisc
+get_current_qdisc() {
+    local dev
+    dev=$(get_main_iface)
+    
+    if [[ -n "$dev" ]] && command -v tc >/dev/null 2>&1; then
+        tc qdisc show dev "$dev" 2>/dev/null | awk '/qdisc/ {print $2; exit}'
+    else
+        sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown"
+    fi
+}
+
+# 检测所有可用的 qdisc
+detect_available_qdiscs() {
+    local available=""
+    
+    # 基础 qdisc（几乎所有内核都支持）
+    available="fq fq_codel pfifo_fast"
+    
+    # 检测 fq_pie（Linux 5.6+）
+    if modprobe sch_fq_pie 2>/dev/null || lsmod | grep -q '^sch_fq_pie'; then
+        available="$available fq_pie"
+    elif [[ -f /lib/modules/$(uname -r)/kernel/net/sched/sch_fq_pie.ko* ]]; then
+        modprobe sch_fq_pie 2>/dev/null
+        available="$available fq_pie"
+    fi
+    
+    # 检测 cake（Linux 4.19+，需要 sch_cake 模块）
+    if modprobe sch_cake 2>/dev/null || lsmod | grep -q '^sch_cake'; then
+        available="$available cake"
+    elif [[ -f /lib/modules/$(uname -r)/kernel/net/sched/sch_cake.ko* ]]; then
+        modprobe sch_cake 2>/dev/null
+        available="$available cake"
+    fi
+    
+    echo "$available"
+}
+
+# 应用 qdisc 到系统
+apply_qdisc_to_system() {
+    local qdisc="$1"
+    local dev
+    dev=$(get_main_iface)
+    
+    # 1. 设置默认 qdisc（sysctl）
+    print_step "设置默认队列规则为 ${qdisc}..."
+    
+    if sysctl -w "net.core.default_qdisc=$qdisc" >/dev/null 2>&1; then
+        # 持久化到配置文件
+        local qdisc_conf="/etc/sysctl.d/99-bbr-qdisc.conf"
+        cat > "$qdisc_conf" << CONF
+# BBR3 队列调度配置
+# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
+net.core.default_qdisc = $qdisc
+CONF
+        print_success "默认队列规则已设置为 $qdisc"
+    else
+        print_error "设置默认队列规则失败"
+        return 1
+    fi
+    
+    # 2. 立即应用到网卡
+    if [[ -n "$dev" ]] && command -v tc >/dev/null 2>&1; then
+        print_step "应用队列规则到网卡 ${dev}..."
+        
+        # 先删除现有 qdisc
+        tc qdisc del dev "$dev" root 2>/dev/null
+        
+        # 根据 qdisc 类型应用不同参数
+        case "$qdisc" in
+            fq)
+                # fq 最佳参数：适合 BBR
+                tc qdisc add dev "$dev" root fq 2>/dev/null && \
+                    print_success "fq 已应用到 $dev" || \
+                    print_warn "fq 应用失败，使用默认参数"
+                ;;
+            fq_codel)
+                # fq_codel 参数：target 5ms, interval 100ms
+                tc qdisc add dev "$dev" root fq_codel target 5ms interval 100ms 2>/dev/null && \
+                    print_success "fq_codel 已应用到 $dev" || \
+                    print_warn "fq_codel 应用失败"
+                ;;
+            fq_pie)
+                # fq_pie 参数：target 15ms
+                tc qdisc add dev "$dev" root fq_pie target 15ms 2>/dev/null && \
+                    print_success "fq_pie 已应用到 $dev" || \
+                    print_warn "fq_pie 应用失败"
+                ;;
+            cake)
+                # cake 参数：自动带宽检测，适合代理
+                # bandwidth 参数可选，不设置则自动检测
+                tc qdisc add dev "$dev" root cake besteffort 2>/dev/null && \
+                    print_success "cake 已应用到 $dev" || \
+                    print_warn "cake 应用失败"
+                ;;
+            *)
+                tc qdisc add dev "$dev" root "$qdisc" 2>/dev/null
+                ;;
+        esac
+    fi
+    
+    return 0
+}
+
+# 队列调度切换菜单
+qdisc_switch_menu() {
+    while true; do
+        clear
+        print_header "队列调度（Qdisc）切换"
+        
+        # 显示当前状态
+        local current_qdisc
+        current_qdisc=$(get_current_qdisc)
+        local default_qdisc
+        default_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+        
+        echo -e "  ${BOLD}当前状态:${NC}"
+        echo -e "    运行中队列: ${GREEN}${current_qdisc}${NC}"
+        echo -e "    默认队列:   ${CYAN}${default_qdisc}${NC}"
+        echo
+        
+        # 检测可用 qdisc
+        local available
+        available=$(detect_available_qdiscs)
+        
+        echo -e "  ${BOLD}可用队列规则:${NC}"
+        for q in fq fq_codel fq_pie cake; do
+            if echo "$available" | grep -qw "$q"; then
+                local status="${GREEN}✓${NC}"
+                [[ "$q" == "$current_qdisc" ]] && status="${GREEN}● 当前${NC}"
+            else
+                local status="${RED}✗ 不可用${NC}"
+            fi
+            printf "    %-12s : %s\n" "$q" "$status"
+        done
+        echo
+        
+        print_separator
+        echo
+        echo -e "  ${BOLD}选择队列规则:${NC}"
+        echo
+        echo -e "  ${GREEN}${BOLD}1)${NC} ${GREEN}fq${NC}         - $(get_qdisc_description fq)"
+        echo -e "  ${CYAN}2)${NC} fq_codel   - $(get_qdisc_description fq_codel)"
+        echo -e "  ${CYAN}3)${NC} fq_pie     - $(get_qdisc_description fq_pie)"
+        echo -e "  ${CYAN}4)${NC} cake       - $(get_qdisc_description cake)"
+        echo
+        echo -e "  ${CYAN}5)${NC} 🔍 查看详细对比"
+        echo -e "  ${CYAN}6)${NC} 🎯 智能推荐"
+        echo
+        echo -e "  ${CYAN}0)${NC} 返回上级菜单"
+        echo
+        
+        read_choice "请选择" 6
+        
+        case "$MENU_CHOICE" in
+            0) return ;;
+            1) apply_qdisc_with_confirm "fq" "$available" ;;
+            2) apply_qdisc_with_confirm "fq_codel" "$available" ;;
+            3) apply_qdisc_with_confirm "fq_pie" "$available" ;;
+            4) apply_qdisc_with_confirm "cake" "$available" ;;
+            5) show_qdisc_comparison ;;
+            6) show_qdisc_recommendation ;;
+        esac
+        
+        echo
+        read -rp "按 Enter 键继续..."
+    done
+}
+
+# 带确认的 qdisc 应用
+apply_qdisc_with_confirm() {
+    local qdisc="$1"
+    local available="$2"
+    
+    echo
+    
+    # 检查是否可用
+    if ! echo "$available" | grep -qw "$qdisc"; then
+        print_error "$qdisc 在当前系统不可用"
+        echo
+        echo -e "  ${YELLOW}可能原因:${NC}"
+        echo "    • 内核版本过低（fq_pie 需要 5.6+，cake 需要 4.19+）"
+        echo "    • 缺少内核模块 sch_${qdisc}"
+        echo
+        echo -e "  ${CYAN}解决方法:${NC}"
+        echo "    • 升级内核版本"
+        echo "    • 安装 iproute2 和相关模块"
+        return 1
+    fi
+    
+    print_header "应用 $qdisc"
+    
+    echo -e "  ${BOLD}队列规则:${NC} $qdisc"
+    echo -e "  ${BOLD}描述:${NC} $(get_qdisc_description "$qdisc")"
+    echo -e "  ${BOLD}推荐场景:${NC} $(get_qdisc_recommendation "$qdisc")"
+    echo
+    
+    if ! confirm "确认切换到 $qdisc？" "y"; then
+        return
+    fi
+    
+    echo
+    apply_qdisc_to_system "$qdisc"
+    
+    echo
+    echo -e "${GREEN}${BOLD}${ICON_OK} 队列规则已切换为 $qdisc${NC}"
+    echo
+    echo -e "  ${BOLD}验证命令:${NC}"
+    echo "    tc qdisc show"
+    echo "    sysctl net.core.default_qdisc"
+}
+
+# 显示 qdisc 对比
+show_qdisc_comparison() {
+    print_header "队列规则详细对比"
+    
+    echo
+    echo -e "  ${BOLD}┌─────────────┬────────────┬────────────┬────────────┬────────────┐${NC}"
+    echo -e "  ${BOLD}│   特性      │     fq     │  fq_codel  │   fq_pie   │    cake    │${NC}"
+    echo -e "  ${BOLD}├─────────────┼────────────┼────────────┼────────────┼────────────┤${NC}"
+    echo -e "  │ 延迟控制    │    ★★★    │   ★★★★★   │   ★★★★    │   ★★★★★   │"
+    echo -e "  │ 吞吐量      │   ★★★★★   │   ★★★★    │   ★★★★    │   ★★★★    │"
+    echo -e "  │ BBR 兼容    │   ★★★★★   │   ★★★★    │   ★★★★    │   ★★★     │"
+    echo -e "  │ 公平性      │   ★★★★    │   ★★★★★   │   ★★★★★   │   ★★★★★   │"
+    echo -e "  │ CPU 占用    │    ★★★    │   ★★★★    │   ★★★★    │    ★★★    │"
+    echo -e "  │ 配置复杂度  │     低     │     低     │     中     │     高     │"
+    echo -e "  │ 内核要求    │   4.0+     │   3.5+     │   5.6+     │   4.19+    │"
+    echo -e "  ${BOLD}└─────────────┴────────────┴────────────┴────────────┴────────────┘${NC}"
+    echo
+    echo -e "  ${BOLD}详细说明:${NC}"
+    echo
+    echo -e "  ${GREEN}fq (Fair Queue)${NC}"
+    echo "    • BBR 官方推荐搭配，提供精确的 pacing"
+    echo "    • 最高吞吐量，适合大文件传输和代理"
+    echo "    • 无主动队列管理（AQM），依赖 BBR 控制拥塞"
+    echo
+    echo -e "  ${CYAN}fq_codel (Fair Queue + CoDel)${NC}"
+    echo "    • 结合公平队列和 CoDel AQM"
+    echo "    • 优秀的延迟控制，抗 Bufferbloat"
+    echo "    • 适合游戏、视频通话等低延迟场景"
+    echo
+    echo -e "  ${YELLOW}fq_pie (Fair Queue + PIE)${NC}"
+    echo "    • 新一代 AQM，PIE 算法比 CoDel 更激进"
+    echo "    • 在高负载下保持低延迟"
+    echo "    • 适合高并发服务器"
+    echo
+    echo -e "  ${PURPLE}cake (Common Applications Kept Enhanced)${NC}"
+    echo "    • 最先进的队列规则，功能最全"
+    echo "    • 自动带宽整形、流量分类、NAT 感知"
+    echo "    • 适合家庭网关、复杂网络环境"
+    echo "    • 注意：与 BBR 搭配可能不如 fq 效果好"
+}
+
+# 智能推荐 qdisc
+show_qdisc_recommendation() {
+    print_header "智能推荐"
+    
+    local current_algo
+    current_algo=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    local available
+    available=$(detect_available_qdiscs)
+    
+    echo
+    echo -e "  ${BOLD}当前拥塞算法:${NC} $current_algo"
+    echo
+    
+    local recommended=""
+    local reason=""
+    
+    # 根据拥塞算法推荐
+    if [[ "$current_algo" =~ ^bbr ]]; then
+        recommended="fq"
+        reason="BBR 算法需要 fq 提供精确的 pacing 支持"
+    else
+        # 非 BBR 算法
+        if echo "$available" | grep -qw "fq_pie"; then
+            recommended="fq_pie"
+            reason="fq_pie 提供更好的延迟控制和公平性"
+        else
+            recommended="fq_codel"
+            reason="fq_codel 是通用场景的最佳选择"
+        fi
+    fi
+    
+    echo -e "  ${GREEN}${BOLD}推荐队列规则: $recommended${NC}"
+    echo -e "  ${DIM}原因: $reason${NC}"
+    echo
+    
+    echo -e "  ${BOLD}场景推荐:${NC}"
+    echo
+    echo -e "    ${GREEN}代理/VPN 服务器:${NC}"
+    echo "      → fq（BBR 最佳搭配，最高吞吐）"
+    echo
+    echo -e "    ${CYAN}游戏/视频通话:${NC}"
+    echo "      → fq_codel（低延迟优先）"
+    echo
+    echo -e "    ${YELLOW}高并发 Web 服务器:${NC}"
+    echo "      → fq_pie（高负载下保持低延迟）"
+    echo
+    echo -e "    ${PURPLE}家庭网关/软路由:${NC}"
+    echo "      → cake（自动带宽整形）"
+    echo
+    
+    if confirm "是否应用推荐的 $recommended？" "y"; then
+        echo
+        apply_qdisc_to_system "$recommended"
+    fi
 }
 
 # 自动调优
